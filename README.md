@@ -1,5 +1,10 @@
 # Quadra core
 
+[![License: MIT](https://img.shields.io/github/license/SteMazzO/quadra-core?logo=Open+Source+Initiative)](https://opensource.org/license/mit)
+[![PyPI version](https://img.shields.io/pypi/v/quadra-core?logo=pypi)](https://pypi.org/project/termtypr/)
+[![PyPI Python](https://img.shields.io/pypi/pyversions/quadra-core?logo=pypi)](https://pypi.org/project/termtypr/)
+[![codecov](https://codecov.io/github/SteMazzO/quadra-core/coverage.svg?branch=main)](https://codecov.io/github/SteMazzO/termtypr?branch=main)
+
 Reads a supermarket till receipt from a photo. No ML model, no network calls: Tesseract does the OCR, then geometry and arithmetic do the rest.
 
 ```python
