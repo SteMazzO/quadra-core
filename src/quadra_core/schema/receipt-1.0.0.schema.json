@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SteMazzO/quadra-core/schema/receipt-1.0.0.schema.json",
+  "title": "Parsed receipt",
+  "description": "One receipt as produced by the parser. Money is integer minor units throughout; fields the parser could not read are null with a warning beside them, never guessed.",
+  "type": "object",
+  "required": ["schema_version", "receipt_id", "profile", "line_items", "totals", "validation"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "receipt_id": { "type": "string", "minLength": 1 },
+
+    "source": {
+      "type": "object",
+      "properties": {
+        "image_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "image_path": { "type": ["string", "null"] },
+        "raw_tsv_path": { "type": ["string", "null"] },
+        "captured_at": { "type": ["string", "null"] },
+        "ingested_at": { "type": ["string", "null"] },
+        "original_filename": { "type": ["string", "null"] }
+      }
+    },
+
+    "profile": {
+      "type": "object",
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "type": "string" },
+        "version": { "type": "integer", "minimum": 1 },
+        "calibrated": { "type": "boolean" },
+        "match_confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+
+    "ocr": {
+      "type": "object",
+      "properties": {
+        "engine": { "type": "string" },
+        "engine_version": { "type": "string" },
+        "lang": { "type": "string" },
+        "psm": { "type": "integer" },
+        "oem": { "type": "integer" },
+        "mean_word_confidence": { "type": "number" },
+        "preprocessing": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "line_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["index", "description", "line_total_minor"],
+        "properties": {
+          "index": { "type": "integer", "minimum": 0 },
+          "description_raw": { "type": "string" },
+          "description": { "type": "string" },
+          "quantity": {
+            "type": ["object", "null"],
+            "required": ["value"],
+            "properties": {
+              "value": {
+                "description": "Decimal string, not a number: fractional weights must survive JSON round-tripping without a float.",
+                "type": "string"
+              },
+              "unit": { "type": "string" }
+            }
+          },
+          "quantity_source": {
+            "enum": ["parsed", "reconstructed", "modifier", "implicit", "assumed", "missing"]
+          },
+          "unit_price_minor": { "type": ["integer", "null"] },
+          "line_total_minor": { "type": ["integer", "null"] },
+          "discounts_minor": { "type": "integer" },
+          "vat_code": { "type": ["string", "null"] },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "provenance": {
+            "type": "object",
+            "properties": {
+              "line_index": { "type": "integer" },
+              "bbox": { "type": "array", "items": { "type": "integer" }, "minItems": 4, "maxItems": 4 }
+            }
+          },
+          "flags": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+
+    "adjustments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "amount_minor"],
+        "properties": {
+          "kind": { "type": "string" },
+          "label": { "type": "string" },
+          "amount_minor": { "type": "integer" },
+          "applies_to_index": { "type": ["integer", "null"] },
+          "provenance": { "type": "object" }
+        }
+      }
+    },
+
+    "totals": {
+      "type": "object",
+      "required": ["items_subtotal_minor", "balanced"],
+      "properties": {
+        "items_subtotal_minor": { "type": "integer" },
+        "discounts_minor": { "type": "integer" },
+        "printed_total_minor": { "type": ["integer", "null"] },
+        "computed_total_minor": { "type": ["integer", "null"] },
+        "balanced": { "type": "boolean" },
+        "delta_minor": { "type": ["integer", "null"] }
+      }
+    },
+
+    "validation": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["ok", "partial", "failed"] },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "passed"],
+            "properties": {
+              "name": { "type": "string" },
+              "passed": { "type": "boolean" },
+              "detail": { "type": "string" }
+            }
+          }
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "review": {
+      "type": "object",
+      "description": "Separate from validation on purpose: validation says whether the data is trustworthy, review says whether a human should look. A random audit is presumed good and flows through; a validation failure is held back.",
+      "properties": {
+        "required": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "sampled": { "type": "boolean" },
+        "mode": { "type": "string" },
+        "state": { "type": "string" },
+        "blind_item_indexes": { "type": "array", "items": { "type": "integer" } },
+        "reviewed_at": { "type": ["string", "null"] },
+        "duration_ms": { "type": ["integer", "null"] },
+        "rows_expanded": { "type": "integer" },
+        "corrections": { "type": "array" }
+      }
+    }
+  }
+}

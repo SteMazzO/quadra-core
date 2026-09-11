@@ -1,0 +1,94 @@
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[project]
+name = "quadra-core"
+version = "0.1.0"
+description = "Deterministic, LLM-free parser for supermarket till receipts."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Stefano Mazzoleni" }]
+keywords = ["receipt", "ocr", "tesseract", "parser", "supermarket", "budgeting"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "Pillow>=11",
+]
+
+[project.urls]
+Homepage = "https://github.com/SteMazzO/quadra-core"
+Repository = "https://github.com/SteMazzO/quadra-core"
+Issues = "https://github.com/SteMazzO/quadra-core/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "jsonschema",
+]
+
+[project.scripts]
+quadra-core = "quadra_core.cli:main"
+
+[tool.uv.build-backend]
+source-include = ["tests/**", "tools/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "F",
+    "E",
+    "W",
+    "I",
+    "D",
+    "N",
+    "UP",
+    "PL",
+    "RUF",
+    "ERA",
+    "PERF",
+    "B",
+    "G",
+    "Q",
+    "C4",
+    "YTT",
+    "T20",
+    "SIM",
+    "PIE",
+    "FIX",
+    "ICN",
+    "LOG",
+    "PYI",
+    "RET",
+]
+ignore = [
+    "B008",     # function-call-in-default-argument
+    "D104",     # undocumented-public-package
+    "D203",     # incorrect-blank-line-before-class
+    "D205",     # missing-blank-line-after-summary
+    "D213",     # multi-line-summary-second-line
+    "E741",     # ambiguous-variable-name
+    "PLR0912",  # too-many-branches
+    "PLR0913",  # too-many-arguments
+    "PLR2004",  # magic-value-comparison
+    "T201",     # print
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*" = ["S101", "D", "T20"]

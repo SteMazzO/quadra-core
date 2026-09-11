@@ -1,0 +1,37 @@
+# Test-only profile for the synthetic receipt in the test suite. It exercises the
+# engine end to end without needing real receipt data. Do not copy its values into
+# a real profile; derive those from actual receipts.
+
+[profile]
+id = "synthetic"
+version = 1
+currency = "EUR"
+calibrated = true
+
+[format]
+decimal_separator = ","
+decimal_places = 2
+money = '\d{1,3},\d{2}'
+quantity = '\d+(?:,\d{1,3})?'
+
+[layout]
+has_quantity_column = true
+has_unit_price_column = true
+modifier_position = "none"
+
+[fingerprint]
+anchors = ["SUPERMERCATO PROVA"]
+min_ratio = 0.75
+
+[regions]
+items_start_after = ["SCONTRINO N"]
+items_end_before = ["TOTALE COMPLESSIVO"]
+
+# Ordered, first match wins. Specific rules before general ones.
+[[rules]]
+name = "total"
+pattern = 'TOTALE'
+
+[[rules]]
+name = "item"
+pattern = '\d{1,3},\d{2}\s*$'
