@@ -1,12 +1,4 @@
-"""Loading shop profiles.
-
-Everything shop-specific lives in a TOML profile rather than in Python. The code
-knows how to find a price column; the profile says what a price looks like. So
-recalibrating does not mean editing code.
-
-Profiles are versioned and each receipt records the version it was parsed under,
-so a layout change means adding v2 instead of quietly changing old results.
-"""
+"""Load shop profiles from TOML."""
 
 from __future__ import annotations
 
@@ -48,7 +40,6 @@ class Profile:
     modifier_position: str
     money_re: re.Pattern[str]
     quantity_re: re.Pattern[str]
-    # None for a shop that prints no such column.
     vat_code_re: re.Pattern[str] | None
     fingerprint: tuple[str, ...]
     min_ratio: float
@@ -72,9 +63,7 @@ def _compile(pattern: str, field: str) -> re.Pattern[str]:
         raise ProfileError(f"{field}: invalid regex {pattern!r}: {exc}") from exc
 
 
-# "before" and "after" say which side of its item a 'N x UNIT' line is printed;
-# "none" is for a shop that prints no such line. A typo here used to disable
-# modifier handling silently, so unknown values are rejected.
+# Which side of its item a 'N x UNIT' line is printed, or "none".
 MODIFIER_POSITIONS = frozenset({"before", "after", "none"})
 
 
@@ -117,8 +106,6 @@ def load(path: Path) -> Profile:
         decimal_separator=fmt.get("decimal_separator", ","),
         decimal_places=int(fmt.get("decimal_places", 2)),
         max_quantity=Decimal(str(fmt.get("max_quantity", 100))),
-        # Esselunga prints DESCRIPTION + PRICE only, with quantity on its own
-        # line when above one, so default to the two-column case.
         has_quantity_column=bool(layout.get("has_quantity_column", False)),
         has_unit_price_column=bool(layout.get("has_unit_price_column", False)),
         modifier_re=(
@@ -139,8 +126,6 @@ def load(path: Path) -> Profile:
         items_start_after=tuple(regions.get("items_start_after", [])),
         items_end_before=tuple(regions.get("items_end_before", [])),
         rules=rules,
-        # An uncalibrated profile is still a scaffold, so callers should not
-        # treat its output as trustworthy.
         calibrated=bool(meta.get("calibrated", False)),
     )
 
@@ -153,10 +138,9 @@ def available() -> list[Profile]:
 
 
 def fuzzy_contains(haystack: str, needle: str, min_ratio: float) -> float:
-    """Best fuzzy match score of `needle` against any window of `haystack`.
+    """Return how well `needle` fuzzily matches part of `haystack`, case-insensitive.
 
-    OCR mangles the all-caps header text that anchors come from, so exact
-    matching is too strict. 'TOTALE' against 'TOTALF' scores 0.833 and matches.
+    Returns 0.0 when the best score is below `min_ratio`.
     """
     haystack, needle = haystack.upper(), needle.upper()
     if needle in haystack:
@@ -165,7 +149,6 @@ def fuzzy_contains(haystack: str, needle: str, min_ratio: float) -> float:
     span = len(needle)
     if span == 0 or len(haystack) < span:
         return 0.0
-    # Slide a needle-sized window; cheap enough for receipt-length strings.
     for start in range(len(haystack) - span + 1):
         score = SequenceMatcher(None, haystack[start : start + span], needle).ratio()
         if score > best:
@@ -178,11 +161,7 @@ def fuzzy_contains(haystack: str, needle: str, min_ratio: float) -> float:
 def select(
     lines: list[str], profiles: list[Profile] | None = None
 ) -> tuple[Profile, float] | None:
-    """Pick the profile whose fingerprint best matches these receipt lines.
-
-    Returns (profile, confidence), or None if nothing matches well enough.
-    None is worth surfacing: it usually means a new shop or a changed layout.
-    """
+    """Return (profile, confidence) for the best fingerprint match, or None."""
     candidates = available() if profiles is None else profiles
     blob = "\n".join(lines)
     best: tuple[Profile, float] | None = None

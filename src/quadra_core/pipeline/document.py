@@ -1,8 +1,4 @@
-"""Building the JSON document for one receipt.
-
-Money leaves here as whole cents, with a _minor suffix so the unit is obvious at
-the call site. Unreadable fields come out null with a warning, never guessed.
-"""
+"""Build the JSON document for one receipt."""
 
 from __future__ import annotations
 
@@ -17,19 +13,12 @@ from quadra_core.profiles.loader import Profile
 
 SCHEMA_VERSION = "1.0.0"
 
-# Below this, the least confident word in a description is too poor to file
-# unseen. Arithmetic cannot catch a misread product name, so this is the only
-# thing that sends one for review.
+# A description less confident than this sends the receipt to review.
 LOW_CONFIDENCE_DESCRIPTION = 0.5
 
 
 def no_review(state: str = "not_required") -> dict[str, Any]:
-    """Build the review block for a document nobody has decided anything about.
-
-    Who gets checked is up to whatever uses this library, so the default says
-    only that no decision has been made yet, rather than claiming the receipt
-    was checked or does not need checking.
-    """
+    """Build a review block that records no decision yet."""
     return {
         "required": False,
         "reason": None,
@@ -40,15 +29,8 @@ def no_review(state: str = "not_required") -> dict[str, Any]:
     }
 
 
-def default_review(
-    validation: Validation, extraction: Extraction
-) -> dict[str, Any]:
-    """Whether a person has to look, when the caller has not said.
-
-    The caller owns this decision and can pass its own block instead. This is
-    the default, and it errs towards asking: a receipt that does not add up, or
-    that carries a description nobody could read, is not one to file unseen.
-    """
+def default_review(validation: Validation, extraction: Extraction) -> dict[str, Any]:
+    """Ask for review if the receipt doesn't balance or a description is unreadable."""
     reasons = []
     if not validation.balanced:
         reasons.append("totals_do_not_balance")
@@ -73,8 +55,7 @@ def default_review(
 def _quantity(value: Decimal | None) -> dict[str, Any] | None:
     if value is None:
         return None
-    # A string rather than a float, since weighed goods need fractions that
-    # binary floats cannot hold exactly.
+    # A string, since weighed quantities need exact fractions.
     return {"value": format(value.normalize(), "f"), "unit": "each"}
 
 

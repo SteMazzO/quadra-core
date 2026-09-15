@@ -1,8 +1,4 @@
-"""Every parser output must validate against the published JSON Schema.
-
-The schema is the contract other tools read the data through, so it is checked
-against real fixture output rather than a hand-written example that can drift.
-"""
+"""Parser output must validate against the published JSON Schema."""
 
 from __future__ import annotations
 
@@ -47,7 +43,7 @@ def test_fixture_output_validates(schema, name, profile):
 
 
 def test_schema_rejects_float_money(schema):
-    """Money must be integer minor units; a float would silently drift a cent."""
+    """Money must be integer minor units."""
     document, _ = parse_tsv(
         (FIXTURES / "esselunga_b.tsv").read_text(),
         profile_id="esselunga",
@@ -59,7 +55,7 @@ def test_schema_rejects_float_money(schema):
 
 
 def test_schema_rejects_numeric_quantity(schema):
-    """Quantity is a string so fractional weights survive JSON round-tripping."""
+    """Quantity must be a string, so fractions survive JSON."""
     document, _ = parse_tsv(
         (FIXTURES / "esselunga_b.tsv").read_text(),
         profile_id="esselunga",

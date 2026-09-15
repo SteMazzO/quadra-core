@@ -1,9 +1,4 @@
-"""`quadra-core` on the command line: read a receipt, print the document.
-
-Small on purpose. It is here so you can try the library and check a profile
-against a photo without writing a script. Storing, reviewing and exporting
-receipts are jobs for whatever gets built on top.
-"""
+"""Read a receipt image or Tesseract TSV and print the receipt document as JSON."""
 
 from __future__ import annotations
 
@@ -15,8 +10,7 @@ from pathlib import Path
 from quadra_core.parse import IMAGE_SUFFIXES, parse_image, parse_tsv, read_input
 from quadra_core.profiles import loader
 
-# Exit code carries the result, so a shell script or worker does not have to
-# parse stdout.
+# The exit code carries the parse status.
 EXIT_OK, EXIT_PARTIAL, EXIT_FAILED, EXIT_ERROR = 0, 1, 2, 3
 
 _STATUS_EXIT = {"ok": EXIT_OK, "partial": EXIT_PARTIAL, "failed": EXIT_FAILED}
@@ -28,7 +22,6 @@ def _run_parse(args: argparse.Namespace) -> int:
         document, status = parse_image(
             source, profile_id=args.profile, printed_total=args.total
         )
-        # Only of use to something archiving the originals.
         document.pop("_tsv", None)
         document.pop("_prepared", None)
     else:
@@ -75,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point. Returns the exit code rather than raising on a bad receipt."""
+    """Run the command line and return its exit code."""
     args = build_parser().parse_args(argv)
     try:
         return args.handler(args)

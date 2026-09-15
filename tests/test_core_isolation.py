@@ -1,10 +1,4 @@
-"""The parsing side must not import Pillow.
-
-Pillow is a required dependency, so this is not about running without it. It is
-about import cost: Pillow takes a few hundred milliseconds to load on a Pi Zero
-2W, and parsing a TSV has no reason to pay that. This keeps the image imports
-lazy.
-"""
+"""Parsing TSV must not import Pillow, which is slow to load on small devices."""
 
 from __future__ import annotations
 

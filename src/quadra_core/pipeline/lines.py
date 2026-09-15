@@ -1,12 +1,4 @@
-"""Turn Tesseract TSV into lines of words, and find the price column.
-
-TSV rather than plain text, because each word's position is needed. Tesseract's
-own line breaks are unreliable on receipts, and splitting on whitespace does not
-survive a bad photo.
-
-Nothing here is shop-specific. Tolerances scale off the median glyph height and
-columns are measured per receipt. Shop settings live in profiles/.
-"""
+"""Turn Tesseract TSV into lines of words, and find the price column."""
 
 from __future__ import annotations
 
@@ -18,8 +10,7 @@ from dataclasses import dataclass
 # Tesseract uses -1 for page/block/para/line rows, which carry no text.
 _NO_TEXT_CONF = -1.0
 
-# Below this the page is straight enough that correcting slope only adds noise.
-# 0.005 is a third of a degree, about 3px across a 700px-wide receipt.
+# Below this slope the page counts as straight.
 _SLOPE_IGNORED = 0.005
 
 
@@ -94,12 +85,9 @@ class Line:
 
 
 def load_tsv(tsv: str) -> list[Word]:
-    """Parse Tesseract TSV into words, skipping blank and structural rows.
-
-    QUOTE_NONE matters. Receipt text contains stray quote characters, and without it
-    csv swallows the rest of the row.
-    """
+    """Parse Tesseract TSV into words, skipping blank and structural rows."""
     words: list[Word] = []
+    # QUOTE_NONE, or a stray quote in receipt text swallows the rest of the row.
     reader = csv.DictReader(io.StringIO(tsv), delimiter="\t", quoting=csv.QUOTE_NONE)
     for row in reader:
         text = (row.get("text") or "").strip()
@@ -120,7 +108,6 @@ def load_tsv(tsv: str) -> list[Word]:
                 )
             )
         except (KeyError, ValueError):
-            # A bad row is noise, so skip it rather than fail the receipt.
             continue
     return words
 
@@ -134,35 +121,23 @@ def median_glyph_height(words: list[Word]) -> float:
 
 
 def drop_speckle(words: list[Word], *, min_height_ratio: float = 0.4) -> list[Word]:
-    """Drop specks of noise that Tesseract reported as words.
-
-    Filters on height, not confidence. On a degraded receipt the confidence scores
-    were useless for this: a speck read as '-' scored 90.7 while the real token
-    '4X125.' scored 0.0. Height separated them cleanly, every speck under 8px against
-    a 29px median and every real word over 18px.
-    """
+    """Drop specks of noise, judged by height since their confidence is unreliable."""
     if not words:
         return []
     threshold = median_glyph_height(words) * min_height_ratio
     kept = [w for w in words if w.height >= threshold]
-    # Recompute once: the artefacts drag the median down slightly.
+    # Recompute once: the specks drag the median down.
     if kept and len(kept) < len(words):
         threshold = median_glyph_height(kept) * min_height_ratio
         kept = [w for w in kept if w.height >= threshold]
     return kept
 
 
-# How many words a row needs, over how much of the page, before its slope counts.
-# Both are low because of the footer: TOTALE EURO and its amount sit at opposite
-# edges in large type, and the neighbouring rows are short ones like 'di cui IVA'.
-# At three words across a quarter of the page the footer got no say in its own
-# slope, the estimate came from the middle of the receipt, and the total was split
-# into two lines: a label with no amount, and an amount belonging to nothing.
+# Low, so short footer rows like 'TOTALE EURO 26,44' still count towards the slope.
 _SLOPE_MIN_WORDS = 2
 _SLOPE_MIN_SPREAD = 0.10
 
-# How many nearby rows vote on the slope at a given height. Enough to outvote a
-# badly fitted row, few enough to still follow the curve.
+# How many nearby rows vote on the slope at a given height.
 _SLOPE_NEIGHBOURS = 5
 
 
@@ -207,16 +182,7 @@ def _median(values: list[float]) -> float:
 
 
 def local_slope(samples: list[tuple[float, float]], y: float) -> float:
-    """Slope of the rows nearest this height on the page.
-
-    One slope for the whole receipt does not work. A till roll photographed flat is
-    curved, not tilted: on a real receipt the rows ran downhill at the top, level in
-    the middle and uphill at the bottom, so the page-wide median came out at 0.001
-    and corrected nothing. The two halves had cancelled out.
-
-    Taking the median of the closest rows follows the curve instead, and stays robust
-    to one badly fitted row.
-    """
+    """Median slope of the rows nearest this height, so a curled page is followed."""
     if not samples:
         return 0.0
     nearest = sorted(samples, key=lambda s: abs(s[0] - y))[:_SLOPE_NEIGHBOURS]
@@ -256,23 +222,12 @@ def _cluster(
 
 
 def group_lines(words: list[Word], *, tolerance: float = 0.6) -> list[Line]:
-    """Group words into lines by their vertical centre.
-
-    Centres rather than overlapping boxes. One oversized box will bridge two rows and
-    merge them: on a real receipt Tesseract gave ARANCE a 40px box against a 22px
-    median, it overlapped the row below, and that row's price was silently lost. The
-    centre of the same box sits a clear 26px away.
-
-    Grouped twice. The first pass finds the rows that are long enough to say which way
-    the page runs; the second uses that slope, so a row is judged against the line it
-    actually sits on rather than a horizontal one. Without it a short description
-    leaves a wide gap before the price, the drop across that gap beats the tolerance,
-    and the item splits into a nameless price and a priceless name.
-    """
+    """Group words into lines by vertical centre, following the page's slope."""
     if not words:
         return []
 
     limit = median_glyph_height(words) * tolerance
+    # The first pass only finds which way the rows slope.
     first = _cluster(words, limit, [])
 
     page_width = max(w.right for w in words) - min(w.left for w in words)
@@ -307,11 +262,7 @@ def text_block(lines: list[Line]) -> Block:
 
 
 def cluster_1d(values: list[float], *, gap: float) -> list[list[float]]:
-    """Split sorted values wherever the step between them exceeds `gap`.
-
-    Not k-means, because we do not know how many columns there are, and this is
-    deterministic with no seed or iteration count.
-    """
+    """Split sorted values wherever the step between them exceeds `gap`."""
     if not values:
         return []
     ordered = sorted(values)
@@ -329,14 +280,9 @@ def discover_price_column(
     *,
     gap: float = 0.08,
 ) -> tuple[float, float] | None:
-    """Find the price column by clustering the right edge of price-like tokens.
+    """Find the price column from the right edges of price-like tokens.
 
-    Returns (min, max) as a fraction of block width, or None if no cluster is big
-    enough to trust.
-
-    Right edges, because prices are right aligned: the left edge moves with the digit
-    count, the right edge does not. On a bad photo these held within 2.9% of the block
-    width even with junk between the description and the price.
+    Returns (min, max) as a fraction of block width, or None if not found.
     """
     block = text_block(lines)
     edges: list[float] = []

@@ -1,11 +1,4 @@
-"""Regenerate the synthetic test fixtures.
-
-Renders a receipt three ways - clean, degraded, and with a printed total that
-does not match its items - then runs Tesseract over each to produce the TSV the
-tests parse. Keeping the generator here makes the fixtures reproducible and
-records what damage each one represents.
-
-Needs Pillow and Tesseract. The tests need neither.
+"""Regenerate the rendered test fixtures. Needs Pillow and Tesseract.
 
 Usage:  python3 tools/make_fixtures.py
 """
@@ -59,11 +52,7 @@ def build(total, out, faded=False, seed=7):
     img.save(out)
 
 
-# Transcribed from two real Esselunga receipts, then rendered rather than
-# photographed. They exercise the layout the profile encodes: two columns, a
-# quantity line above its item, and a discount signed on the right. They are not
-# a substitute for OCR of the real photos, which also carry perspective, thermal
-# fade and creases.
+# Transcribed from two real Esselunga receipts, rendered rather than photographed.
 ESSELUNGA_A = [
     "* Esselunga S.p.A. *",
     "VIA ROMA 00 - CITTA",
@@ -117,13 +106,12 @@ ESSELUNGA_B = [
 ]
 
 OUT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "ocr"
-TOTAL = "32,02"  # the items really do sum to this; do not hardcode a guess
+TOTAL = "32,02"
 
 VARIANTS = [
     ("synthetic_clean", TOTAL, False, 7),
     ("synthetic_faded", TOTAL, True, 11),
-    # A printed total 1,00 below the true sum, so the arithmetic check has
-    # something it has to fail on.
+    # Printed total 1,00 below the items, so the arithmetic check must fail.
     ("synthetic_unbalanced", "31,02", False, 7),
 ]
 

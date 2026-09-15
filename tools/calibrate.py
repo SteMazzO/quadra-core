@@ -1,12 +1,6 @@
-"""Show what the parser sees on a receipt, so a profile can be written from it.
+"""Show what the parser sees on a receipt, to help write a profile.
 
-Prints the preprocessing steps, the reconstructed lines with their confidence, the
-price column it found, and under a given profile which rule claimed each line and what
-came out. Writing a profile without this is guesswork.
-
-A new shop needs a stub profile before there is anything to report against;
-with no --profile the receipt is fingerprinted against the shops already
-shipped, which a new one will not match. See 'Adding a shop' in README.md.
+A new shop needs a stub profile first; see 'Adding a shop' in README.md.
 
 Usage:
     python3 tools/calibrate.py receipt.jpg                     # detect the shop
@@ -169,8 +163,6 @@ def main() -> int:
     if args.save_fixture:
         save_fixture(tsv, args.save_fixture)
 
-    # No profile means no report, whether a named one was missing or the fingerprint
-    # matched nothing. Either way this run produced nothing to act on.
     profile = report_geometry(tsv, lines, args.profile)
     if profile is None:
         return 2

@@ -27,12 +27,10 @@ from quadra_core.pipeline.money import format_minor  # noqa: E402
 from quadra_core.pipeline.validate import validate  # noqa: E402
 from quadra_core.profiles import loader  # noqa: E402
 
-# ~300 DPI across 80mm thermal paper. Bigger costs time for no accuracy gain,
-# smaller drops cap height below what the LSTM reads reliably.
+# About 300 DPI across 80mm paper.
 TARGET_WIDTH = 1100
 
-# Minimum whitespace around the text before Tesseract's layout analysis suffers.
-# Only topped up when the image has less; see preprocess().
+# Whitespace to keep around the text; topped up only when the image has less.
 MIN_MARGIN = 12
 
 # Limit upscaling for very small source images.
@@ -48,20 +46,12 @@ def preprocess(path: Path, out_dir: Path | None) -> tuple[Path, dict]:
 
     with Image.open(path) as source:
         stats["source_px"] = source.width * source.height
-        # DCT-domain downscale during JPEG decode. Never builds the full-size RGB
-        # buffer, so it is the cheapest resize available.
+        # Downscale during JPEG decode.
         if source.format == "JPEG":
             source.draft("L", (TARGET_WIDTH, TARGET_WIDTH * 4))
-        # EXIF orientation first. Phones store photos rotated with a tag, and
-        # skipping this OCRs the receipt sideways with no warning.
         img = ImageOps.exif_transpose(source).convert("L")
 
-    # Scale toward the target in both directions. Downscaling is the usual case
-    # and the main latency lever. Upscaling matters when an image arrives too
-    # small: Tesseract's LSTM needs a minimum glyph height, and a 444px-wide
-    # receipt reads at 84.6 mean confidence natively but 89.0 when tripled.
-    # It cannot add detail that was never there - a 338px receipt stays
-    # unreadable at any factor - but it does recover merely small ones.
+    # Scale toward the target either way: small receipts read better enlarged.
     if img.width != TARGET_WIDTH:
         scale = TARGET_WIDTH / img.width
         if scale > MAX_UPSCALE:
@@ -71,19 +61,7 @@ def preprocess(path: Path, out_dir: Path | None) -> tuple[Path, dict]:
         img = img.resize((round(img.width * scale), height), Image.LANCZOS)
         stats["scale"] = round(scale, 2)
 
-    # Pad ONLY if the content is already close to an edge.
-    #
-    # Received wisdom says to always add a white margin because Tesseract's layout
-    # analysis struggles when text touches the border. Measured on a degraded receipt
-    # that already has whitespace, padding unconditionally hurts, because it
-    # perturbs Tesseract's internal scaling and the receipt stopped balancing:
-    #
-    #     no padding   delta      0   (correct)
-    #     +5px         delta  +1851
-    #     +20px        delta   -149
-    #     +40px        delta   -405   and one item lost entirely
-    #
-    # So measure what margin is there and top it up only when it is thin.
+    # Pad only a thin margin: padding a receipt that already has one changes the OCR.
     content = ImageOps.invert(img).getbbox()
     if content:
         margin = min(

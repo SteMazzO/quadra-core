@@ -40,11 +40,7 @@ def test_parse_money(token, expected):
 
 
 def test_confusion_repair_is_gated_on_looking_numeric():
-    """Ungated, the confusion map turns 'abc' into money.
-
-    'b' maps to '6' and 'c' is stripped, yielding 600 minor units from a pure word.
-    The digit-ratio gate is what prevents descriptions being read as prices.
-    """
+    """Letter-to-digit repair only applies to tokens that already look numeric."""
     assert repair_numeric("abc") == "a6c"  # the map itself is indiscriminate
     assert digit_ratio("abc") == 0.0
     assert parse_money("abc") is None  # the gate stops it
@@ -67,7 +63,7 @@ def test_parse_money_never_raises_on_hostile_input():
     ],
 )
 def test_parse_quantity_rejects_descriptive_tokens(token, expected):
-    """'1L' is part of a product name, not a quantity: digit ratio 0.5 rejects it."""
+    """'1L' is part of a product name, not a quantity."""
     assert parse_quantity(token) == expected
 
 

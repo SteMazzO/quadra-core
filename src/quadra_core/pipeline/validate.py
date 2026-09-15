@@ -1,11 +1,4 @@
-"""Check a receipt against its own arithmetic.
-
-Quantity times unit price should equal the line total, and the lines should sum
-to the printed total. That redundancy is what makes OCR output checkable.
-
-Only numbers are checked here. A misread product name passes everything in this
-module, which is why review sampling exists.
-"""
+"""Check a receipt against its own arithmetic."""
 
 from __future__ import annotations
 
@@ -15,9 +8,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from quadra_core.pipeline.extract import Extraction, LineItem
 from quadra_core.profiles.loader import Profile
 
-# Flags this module owns. parse_tsv validates twice when a repair runs, so these
-# are cleared before each pass; flags set elsewhere (price_reread, line_recovered)
-# are left alone.
+# Flags owned by this module, cleared before each run since a repair validates twice.
 CHECK_FLAGS = frozenset({"line_arithmetic", "quantity_verified"})
 
 
@@ -32,7 +23,7 @@ class Check:
 
 @dataclass(slots=True)
 class Validation:
-    """The result of running the arithmetic oracle on a receipt extraction."""
+    """The result of running the arithmetic checks on a receipt extraction."""
 
     status: str  # "ok" | "partial" | "failed"
     checks: list[Check] = field(default_factory=list)
@@ -40,7 +31,6 @@ class Validation:
     items_subtotal_minor: int = 0
     printed_total_minor: int | None = None
     delta_minor: int | None = None
-    # Which independent figure the item sum was checked against.
     total_source: str = "none"  # "printed" | "payments" | "none"
 
     @property
@@ -62,22 +52,11 @@ def check_line_arithmetic(item: LineItem) -> Check:
         Decimal(1), rounding=ROUND_HALF_UP
     )
     delta = abs(int(expected) - item.line_total_minor)
-    # One minor unit of slack, since stores round weighed goods differently and
-    # the convention is not something to assume.
     return Check("line_arithmetic", delta <= 1, f"delta={delta}")
 
 
 def check_quantity_verified(item: LineItem, profile: Profile) -> Check:
-    """Report whether the quantity was corroborated, not whether it looks right.
-
-    Arithmetic cannot separate these two, both from the same photo and both
-    non-integer:
-
-        MELE GOLDEN KG   q=1.241  unit=2,49   correct, sold by weight
-        YOGURT MAGRO     q=0.111  unit=31,15  wrong, '1,15' read as '31,15'
-
-    Anything claiming to tell them apart would be guessing, so send both for review.
-    """
+    """Report whether the quantity was corroborated, not whether it looks right."""
     q = item.quantity
     if q is None:
         return Check("quantity_verified", False, "missing")
@@ -115,11 +94,7 @@ def validate(extraction: Extraction, profile: Profile) -> Validation:
 
     result.items_subtotal_minor = subtotal
 
-    # Amounts tendered less any change restates the total independently of the
-    # item lines, so it is a real cross-check. It also rescues receipts whose
-    # printed total is in a font Tesseract cannot read: on one photo
-    # 'TOTALE EURO 26,44' came back as 'db, +' at every scale and threshold,
-    # while 0,04 + 9,50 + 16,90 read cleanly.
+    # Payments less change restate the total, and survive when the total is unreadable.
     payments_total = (
         sum(extraction.payments_minor) - extraction.change_minor
         if extraction.payments_minor
@@ -127,11 +102,7 @@ def validate(extraction: Extraction, profile: Profile) -> Validation:
     )
     printed = extraction.printed_total_minor
 
-    # The items and the payment line are read independently of each other. When
-    # they agree and the printed total does not, the printed total is the one that
-    # was misread: 33 item prices do not conspire to match a payment line by
-    # accident. Seen on a real photo where 'TOTALE EURO 101,29' came back as
-    # '101,2' + '4' and joined to 101,24, against items and payments both at 101,29.
+    # Items and payments agree but the printed total doesn't: the total was misread.
     corroborated = (
         not extraction.printed_total_supplied
         and printed is not None
@@ -157,7 +128,6 @@ def validate(extraction: Extraction, profile: Profile) -> Validation:
                 "receipt_total", result.delta_minor == 0, f"delta={result.delta_minor}"
             )
         )
-        # If both are readable they have to agree, otherwise one was misread.
         if payments_total is not None and payments_total != printed:
             result.warnings.append(
                 f"payments_disagree_with_printed_total:{payments_total}!={printed}"
@@ -179,9 +149,6 @@ def validate(extraction: Extraction, profile: Profile) -> Validation:
             Check("receipt_total", False, "no total or payments found")
         )
 
-    # A line that looked like a product but had no readable price takes its
-    # money out of the total. Warn about it, or the receipt is wrong with
-    # nothing to point at.
     for line_index in extraction.skipped_lines:
         result.warnings.append(f"line_without_a_price:{line_index}")
 
@@ -199,7 +166,6 @@ def validate(extraction: Extraction, profile: Profile) -> Validation:
         )
     )
 
-    # Status. A receipt is always returned, graded rather than discarded.
     if not extraction.items:
         result.status = "failed"
     elif any(not c.passed for c in result.checks) or result.warnings:

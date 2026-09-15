@@ -1,10 +1,4 @@
-"""End-to-end parsing tests over real Tesseract output.
-
-synthetic_clean and synthetic_faded are the same receipt; the faded one was
-captured at 35% contrast with blur and salt-and-pepper noise (mean word
-confidence ~55). synthetic_unbalanced prints a total that disagrees with its own
-line items by 1,00, to check that the arithmetic actually fails when it should.
-"""
+"""End-to-end parsing tests over OCR of a synthetic receipt."""
 
 from __future__ import annotations
 
@@ -36,7 +30,7 @@ def run(name: str):
 
 @pytest.mark.parametrize("name", ["synthetic_clean", "synthetic_faded"])
 def test_all_line_totals_recovered_regardless_of_image_quality(name):
-    """The headline claim: prices survive degradation that wrecks descriptions."""
+    """Prices survive degradation that wrecks descriptions."""
     ex, _ = run(name)
     assert [i.line_total_minor for i in ex.items] == EXPECTED_TOTALS
 
@@ -79,13 +73,7 @@ def test_degraded_receipt_degrades_to_partial_rather_than_lying():
 
 
 def test_uncorroborated_fractional_quantities_are_flagged_for_review():
-    """Arithmetic cannot judge whether a fractional quantity is real.
-
-    The faded fixture contains one genuine weighed item (MELE GOLDEN KG, 1.241) and
-    one misread (YOGURT, 0.111, because '1,15' was read as '31,15'). Both are
-    non-integer reconstructions and nothing in the numbers distinguishes them, so the
-    parser must flag both rather than pretend to tell them apart.
-    """
+    """Real and misread fractional quantities look alike, so both are flagged."""
     ex, _ = run("synthetic_faded")
     fractional = [
         i
@@ -129,11 +117,7 @@ def test_profile_fingerprint_matches_from_degraded_ocr():
 
 
 def test_uncalibrated_profile_warns():
-    """A scaffold profile must not produce confident output.
-
-    Built in-memory rather than from disk: the shipped Esselunga profile is now
-    calibrated from real receipts, so the warning path needs its own fixture.
-    """
+    """An uncalibrated profile adds a warning."""
     ex, _ = run("synthetic_clean")
     base = profile()
     scaffold = replace(base, id="scaffold", calibrated=False)
@@ -150,7 +134,6 @@ def test_output_is_json_serialisable_and_uses_minor_units():
     json.dumps(doc)  # must not raise
     for item in doc["line_items"]:
         assert isinstance(item["line_total_minor"], int)
-        # Quantity is a string, so fractional weights survive JSON round-tripping.
         assert isinstance(item["quantity"]["value"], str)
 
 
@@ -172,8 +155,7 @@ def _extraction(items_total: int, printed: int, payments: list[int]):
 
 
 def test_a_misread_printed_total_loses_to_items_and_payments_agreeing():
-    """The real case: OCR read 'TOTALE EURO 101,29' as 101,24 while the items and
-    the payment line both came to 101,29."""
+    """Items and payments agreeing on 101,29 beat a total misread as 101,24."""
     ex = _extraction(items_total=10129, printed=10124, payments=[10129])
     result = validate(ex, profile())
     assert result.balanced
@@ -183,7 +165,7 @@ def test_a_misread_printed_total_loses_to_items_and_payments_agreeing():
 
 
 def test_printed_total_still_wins_when_nothing_corroborates_it():
-    """Only two figures, and they disagree: no grounds to overrule the paper."""
+    """Without corroboration the printed total stands."""
     ex = _extraction(items_total=9000, printed=10124, payments=[10129])
     result = validate(ex, profile())
     assert not result.balanced
@@ -202,7 +184,7 @@ def test_validating_twice_does_not_stack_flags():
 
 
 def test_a_repaired_item_can_come_back_clean():
-    """A stale flag from the first pass used to keep a fixed receipt dirty."""
+    """A fixed item loses its stale flag."""
     ex, _ = run("synthetic_clean")
     broken = ex.items[0].line_total_minor
     ex.items[0].line_total_minor = broken + 500
@@ -214,7 +196,6 @@ def test_a_repaired_item_can_come_back_clean():
 
 
 def test_a_receipt_that_does_not_balance_is_sent_for_review():
-    """Filing an unbalanced receipt unseen is the one thing review is for."""
     document, status = parse_tsv(
         (FIXTURES / "synthetic_unbalanced.tsv").read_text(), profile_id="synthetic"
     )
@@ -243,8 +224,7 @@ def test_the_caller_keeps_the_last_word_on_review():
 
 
 def test_a_typed_in_total_is_never_overruled_by_the_payment_line():
-    """--total is for a person reading the paper when OCR could not. Nothing
-    downstream gets to second-guess that, corroboration included."""
+    """A total typed in with --total is never overruled."""
     ex = _extraction(items_total=10129, printed=9999, payments=[10129])
     ex.printed_total_supplied = True
     result = validate(ex, profile())

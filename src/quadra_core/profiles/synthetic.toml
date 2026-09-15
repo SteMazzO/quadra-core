@@ -1,6 +1,4 @@
-# Test-only profile for the synthetic receipt in the test suite. It exercises the
-# engine end to end without needing real receipt data. Do not copy its values into
-# a real profile; derive those from actual receipts.
+# Test-only profile for the synthetic receipt fixtures.
 
 [profile]
 id = "synthetic"
@@ -27,7 +25,6 @@ min_ratio = 0.75
 items_start_after = ["SCONTRINO N"]
 items_end_before = ["TOTALE COMPLESSIVO"]
 
-# Ordered, first match wins. Specific rules before general ones.
 [[rules]]
 name = "total"
 pattern = 'TOTALE'

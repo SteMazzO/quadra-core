@@ -1,13 +1,4 @@
-"""Real receipt OCR, kept with the library rather than with the tests.
-
-This is the corpus the Esselunga profile was calibrated against. It ships so
-anyone writing a profile for another shop has known-good output to compare
-against.
-
-The address, loyalty number and points balance are replaced with placeholders.
-The shop name, VAT number, products and prices are real, and so is every
-bounding box, since the geometry is what the tests check.
-"""
+"""Real receipt OCR fixtures, with personal data replaced by placeholders."""
 
 from __future__ import annotations
 

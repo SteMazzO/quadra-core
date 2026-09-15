@@ -12,11 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:  # Pillow is needed only to OCR an image, never to parse TSV.
+if TYPE_CHECKING:  # Pillow is only needed to OCR an image.
     from PIL import Image
 
-# 512MB total. Cap the child well below it so it dies on its own instead of
-# letting the OOM killer pick a process.
+# Well under a 512MB box, so Tesseract fails by itself before the OOM killer acts.
 MEMORY_LIMIT_BYTES = 320 * 1024 * 1024
 TIMEOUT_SECONDS = 60
 
@@ -44,22 +43,17 @@ def _base_flags(psm: int, oem: int, lang: str) -> list[str]:
         str(psm),
         "-l",
         lang,
-        # Keeps the run of spaces between description and price. Geometry is the
-        # main signal, but this makes the raw text usable as a cross-check.
         "-c",
         "preserve_interword_spaces=1",
-        # Receipt text is mostly abbreviations and product codes.
+        # Receipts are mostly abbreviations and codes, so skip the dictionaries.
         "-c",
         "load_system_dawg=0",
         "-c",
         "load_freq_dawg=0",
-        # Without this Tesseract guesses a DPI and can rescale badly. Phone JPEGs
-        # often carry no useful resolution metadata.
+        # Phone JPEGs rarely carry a usable DPI.
         "-c",
         "user_defined_dpi=300",
-        # Skip the inverted-image retry, since input is always dark on light.
-        # This is invert_threshold, not tessedit_do_invert, which 5.3.4
-        # deprecates and Tesseract 6 removes.
+        # No inverted-image retry: input is always dark on light.
         "-c",
         "invert_threshold=0",
     ]
@@ -71,12 +65,8 @@ def _limit_memory() -> None:
 
 @functools.lru_cache(maxsize=1)
 def tesseract_path() -> str:
-    """Absolute path to tesseract, or raise if it is not installed.
-
-    The child runs with a fixed PATH, so resolving here and passing the full
-    path is what keeps an install outside /usr/bin working: /usr/local/bin and
-    Homebrew both used to pass this check and then fail to launch.
-    """
+    """Absolute path to tesseract, or raise if it is not installed."""
+    # Resolved here because the child process runs with a fixed PATH.
     found = shutil.which("tesseract")
     if found is None:
         raise OcrError(
@@ -88,11 +78,7 @@ def tesseract_path() -> str:
 
 @functools.lru_cache(maxsize=1)
 def engine_version() -> str:
-    """Report the installed Tesseract version, or raise if it is absent.
-
-    Cached: this used to spawn a process on every OCR call, and a photo makes
-    three or more of those.
-    """
+    """Report the installed Tesseract version, or raise if it is absent."""
     result = subprocess.run(
         [tesseract_path(), "--version"], capture_output=True, text=True, check=False
     )
@@ -103,8 +89,7 @@ def engine_version() -> str:
 def _child_env(threads: int) -> dict[str, str]:
     """Build a fixed environment, so no ambient locale changes how numbers read."""
     env = {"OMP_THREAD_LIMIT": str(threads), "PATH": "/usr/bin:/bin", "LC_ALL": "C"}
-    # Installs outside the Debian layout keep their language data elsewhere and
-    # find it through this. Without it they fail with "Error opening data file".
+    # Needed by installs that keep language data outside the Debian layout.
     tessdata = os.environ.get("TESSDATA_PREFIX")
     if tessdata:
         env["TESSDATA_PREFIX"] = tessdata
@@ -120,13 +105,7 @@ def run(
     timeout: int = TIMEOUT_SECONDS,
     threads: int = 1,
 ) -> OcrResult:
-    """OCR an image and return Tesseract's TSV.
-
-    The image goes in on stdin and results come back on stdout, so no temp files.
-
-    threads defaults to 1 because Tesseract's OpenMP support often runs slower on
-    small images and uses more memory.
-    """
+    """OCR an image and return Tesseract's TSV."""
     version = engine_version()
 
     buffer = io.BytesIO()
@@ -161,11 +140,7 @@ def run(
 
 
 def run_on_path(path: Path, **kwargs) -> tuple[OcrResult, object, object]:
-    """Preprocess a photograph and OCR it.
-
-    Returns the prepared image as well. Word boxes are in its coordinates, not the
-    original photo's, so anything cropping by box needs this one.
-    """
+    """Preprocess and OCR a photo; returns (result, report, prepared image)."""
     from .preprocess import preprocess  # noqa: PLC0415 - keeps Pillow optional
 
     image, report = preprocess(path)
