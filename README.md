@@ -18,7 +18,7 @@ document, status = parse_image(Path("receipt.jpg"), profile_id="esselunga")
 
 The line totals plus any discounts have to equal the printed total, so the parser can check its own work.
 
-When the sums don't match it crops out the price column and OCRs that on its own, which gives a second independent reading of every price. Where the two readings disagree it keeps both and picks the combination that hits the printed total. That also recovers lines whose price was unreadable the first time. If two different combinations both add up it changes nothing and flags the receipt.
+When the sums don't match, it OCRs the price column on its own three different ways, and each reading votes on every price. It then picks the prices that hit the printed total, overruling a clear majority of readings on one line at most. This also recovers lines whose price or discount was unreadable the first time. If the best answers are tied, it changes nothing and flags the receipt.
 
 ## Adding a shop
 

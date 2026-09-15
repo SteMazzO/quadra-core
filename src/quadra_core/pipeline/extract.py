@@ -1,9 +1,4 @@
-"""Turn lines of words into receipt items.
-
-Uses column position, not whitespace. On a bad photo the gap between description
-and price fills with junk, so splitting on runs of spaces breaks down. The price
-column holds up.
-"""
+"""Turn lines of words into receipt items, by column position rather than spacing."""
 
 from __future__ import annotations
 
@@ -46,19 +41,12 @@ class LineItem:
     flags: list[str] = field(default_factory=list)
 
 
-# Rules whose lines can still turn into an item or an adjustment. Anything else the
-# profile names is skipped.
 ITEM_CANDIDATE_RULES = frozenset({"item", "unknown", "discount"})
 
 
 @dataclass(slots=True)
 class Adjustment:
-    """A discount or similar amount that is not a product.
-
-    Kept apart from the items rather than folded into a price, so the data still
-    matches the paper. A discount is a fact about the transaction, not a cheaper jar
-    of olives.
-    """
+    """A discount or similar amount, kept apart from the items."""
 
     kind: str
     label: str
@@ -68,13 +56,7 @@ class Adjustment:
 
 @dataclass(slots=True)
 class Modifier:
-    """A quantity line like '8 x 2,99'.
-
-    Which item it belongs to is decided by arithmetic, not position. By eye it is
-    ambiguous: on one receipt it sits between two products and could belong to
-    either, but 8 x 2,99 = 23,92 settles it. The profile's `modifier_position` is
-    only a tiebreaker for when the arithmetic cannot decide.
-    """
+    """A quantity line like '8 x 2,99', matched to its item by arithmetic."""
 
     quantity: Decimal
     unit_price_minor: int
@@ -101,32 +83,16 @@ class Extraction:
     printed_total_minor: int | None
     item_region: tuple[int, int]
     price_column: tuple[float, float] | None
-    # True when a person typed the total in because OCR could not read it. That
-    # is the best evidence there is, so nothing downstream may overrule it.
+    # Set when a person typed the total in; nothing downstream may overrule it.
     printed_total_supplied: bool = False
     warnings: list[str] = field(default_factory=list)
-    # Lines that looked like products but had no readable price. Kept so the
-    # second reading can try again, since a dropped line takes its money with it.
+    # Lines that looked like products but had no readable price.
     skipped_lines: list[int] = field(default_factory=list)
 
 
 def find_item_region(lines: list[Line], profile: Profile) -> tuple[int, int]:
-    """Find the block of items, between the anchors the profile names.
-
-    Anchors are matched loosely because OCR mangles the all-caps header text they come
-    from. If none match we fall back to the whole receipt: too wide a region gives
-    items that fail classification, which is recoverable, while an empty one loses the
-    receipt entirely.
-
-    The end anchor is found first, and it keeps the line it matched. Esselunga's
-    start anchor is the word EURO, printed over the price column, and its end
-    anchor is TOTALE EURO - so the start anchor matches the end anchor's own line.
-    That does no harm while the column header survives OCR, because the header
-    comes first. On a receipt where it did not survive, the first EURO on the page
-    was the one in TOTALE EURO, the items began after the total, and a receipt with
-    eight perfectly readable products yielded none at all. Items cannot follow the
-    total, so the search for where they start has no business past it.
-    """
+    """Return the (start, end) line range between the profile's anchors."""
+    # Find the end first: Esselunga's start anchor 'EURO' also matches 'TOTALE EURO'.
     end = len(lines)
     for i, line in enumerate(lines):
         if any(
@@ -147,26 +113,24 @@ def find_item_region(lines: list[Line], profile: Profile) -> tuple[int, int]:
 
     if start < end:
         return (start, end)
-    # The anchors contradict each other. Keeping the footer out still beats
-    # reading the whole page, so only the start anchor is dropped.
+    # The anchors contradict each other: drop the start one, still exclude the footer.
     return (0, end) if end else (0, len(lines))
 
 
-# OCR sometimes splits one number in two, usually at the decimal comma, so
-# '0,48-S' arrives as '0,' and '48-S'. On a real receipt the halves sat 10-14px
-# apart while the narrowest genuine space was 20px, against a 25px median glyph
-# height. Well under a space, so join them.
+# OCR often splits a price at the comma ('0,' '48-S'). Join halves closer than
+# this many glyph heights, or this many when the split is at the separator itself.
 _JOIN_GAP_RATIO = 0.6
+_SEPARATOR_JOIN_GAP_RATIO = 1.0
+_ENDS_IN_SEPARATOR = re.compile(r"\d[,.;:]$")
+_STARTS_WITH_SEPARATOR = re.compile(r"^[,.;:]\d")
 
-# A trailing sign, held aside while the number is cleaned up. Esselunga writes a
-# negative as '7,20-S', so the letter after the dash belongs to the sign.
+# How far outside the price column, as a fraction of text width, a price may sit.
+_COLUMN_DRIFT = 0.2
+
+# Esselunga writes a negative as '7,20-S'.
 _SIGN_TAIL = re.compile(r"-\s*[^\d\s]?\s*$")
 
-
-# OCR reads marks from the shadow along the paper's edge as words. They are full
-# height, so drop_speckle cannot see them, but they come back far less confident
-# than real text. Only stripped from the front of a description, which is where
-# they land, and never so far that nothing is left.
+# Shadows at the paper's edge come back as low-confidence one-letter words.
 _EDGE_NOISE_CONF = 60.0
 
 
@@ -183,21 +147,13 @@ def _strip_leading_noise(words: list[Word]) -> list[Word]:
 
 
 def _trim(text: str) -> str:
-    """Drop OCR's decoration from both ends of a number, keeping its sign.
-
-    Listing the junk character by character does not work: a crease reads as a
-    bracket, a speck as a degree sign, an edge as a backtick, and the list is never
-    finished. A price starts and ends with a digit, so anything else on either end
-    can go. On this receipt a stray ')' on '4,88)' was enough to drop the line and
-    lose 4,88 from the total silently.
-    """
+    """Drop OCR junk from both ends of a number, keeping its sign."""
     text = text.strip()
     sign = ""
     tail = _SIGN_TAIL.search(text)
     if tail:
         sign = tail.group(0)
         text = text[: tail.start()]
-    # A leading minus is a real sign on receipts that write it that way.
     lead = "-" if text.startswith("-") else ""
     core = re.sub(r"^\D+", "", re.sub(r"\D+$", "", text))
     return f"{lead}{core}{sign}"
@@ -206,19 +162,16 @@ def _trim(text: str) -> str:
 def parse_amount(text: str, profile: Profile) -> int | None:
     """Parse one candidate token, or None if it is not money in this profile."""
     token = normalize_separators(_trim(text), profile.decimal_separator)
-    # Match on the unsigned core, then parse the signed token, so profiles do not
-    # have to know about sign conventions.
+    # Profile money patterns don't include the sign.
     if not profile.money_re.fullmatch(strip_sign(token)):
         return None
     return parse_money(token, places=profile.decimal_places)
 
 
 def _money_tokens(line: Line, profile: Profile) -> list[tuple[int, int, int]]:
-    """(first_word, last_word, minor_units) for every amount on the line.
+    """Return (first_word, last_word, cents) for every amount on the line.
 
-    First and last differ only where a number was split across two words. Both are
-    needed: the description ends at the first, and whether the amount sits in the
-    price column is judged from the right edge of the last.
+    First and last differ when a number was split across two words.
     """
     out: list[tuple[int, int, int]] = []
     limit = median_glyph_height(line.words) * _JOIN_GAP_RATIO
@@ -231,10 +184,17 @@ def _money_tokens(line: Line, profile: Profile) -> list[tuple[int, int, int]]:
             i += 1
             continue
 
-        # Not money by itself. It may be half of one.
         if i + 1 < len(line.words):
             nxt = line.words[i + 1]
-            if nxt.left - word.right <= limit:
+            at_separator = _ENDS_IN_SEPARATOR.search(
+                word.text
+            ) or _STARTS_WITH_SEPARATOR.search(nxt.text)
+            gap_limit = (
+                median_glyph_height(line.words) * _SEPARATOR_JOIN_GAP_RATIO
+                if at_separator
+                else limit
+            )
+            if nxt.left - word.right <= gap_limit:
                 joined = parse_amount(word.text + nxt.text, profile)
                 if joined is not None:
                     out.append((i, i + 1, joined))
@@ -286,7 +246,6 @@ def _resolve_quantity(
     """Work out the quantity for one line, from whichever source the shop gives."""
     first_money = min(first for first, _last, _v in money)
     if modifier is not None:
-        # A preceding 'N x UNIT' line is authoritative and checkable.
         return _Quantity(
             modifier.quantity, modifier.unit_price_minor, "modifier", first_money
         )
@@ -297,9 +256,7 @@ def _resolve_quantity(
     desc_end = first_money
     flags: list[str] = []
 
-    # The quantity column sits immediately left of the first amount. Read it
-    # whether or not the shop prints a unit price too: plenty print quantity and
-    # line total only.
+    # The quantity column sits just left of the first amount.
     if profile.has_quantity_column and first_money > 0:
         candidate = parse_quantity(
             line.words[first_money - 1].text, separator=profile.decimal_separator
@@ -321,8 +278,7 @@ def _resolve_quantity(
                     flags.append("quantity_disagreement")
                     quantity, source = derived, "reconstructed"
     elif quantity is not None and quantity > 0:
-        # Quantity but no printed unit price, so derive it. Leaving it None would
-        # make the per-line check flag every line on the receipt.
+        # Derive the unit price, or the per-line check would flag every line.
         unit_minor = int(
             (Decimal(total_minor) / quantity).quantize(
                 Decimal(1), rounding=ROUND_HALF_UP
@@ -330,12 +286,44 @@ def _resolve_quantity(
         )
 
     if quantity is None:
-        # Nothing said otherwise: one of whatever it is, at the line total.
         quantity, source = Decimal(1), "implicit"
         if not profile.has_unit_price_column:
             unit_minor = total_minor
 
     return _Quantity(quantity, unit_minor, source, desc_end, flags)
+
+
+def read_vat_code(text: str, profile: Profile) -> str | None:
+    """Return the VAT bracket a word spells, or None if it is not one."""
+    if profile.vat_code_re is None:
+        return None
+    marker = profile.vat_code_re.fullmatch(text)
+    if not marker:
+        return None
+    # With a capture group the code is the group; the rest is the OCR'd asterisk.
+    found = marker.group(1) if marker.groups() else marker.group(0)
+    return found.strip().lower() or None
+
+
+def price_candidates(
+    line: Line,
+    money: list[tuple[int, int, int]],
+    block: Block,
+    price_column: tuple[float, float] | None,
+) -> list[tuple[int, int, int]]:
+    """Return the amounts that can be the line's price: in the column, else near it."""
+    if price_column is None:
+        return money
+    low, high = price_column
+
+    def within(margin: float) -> list[tuple[int, int, int]]:
+        return [
+            (first, last, v)
+            for first, last, v in money
+            if low - margin <= block.fraction(line.words[last].right) <= high + margin
+        ]
+
+    return within(0.03) or within(_COLUMN_DRIFT)
 
 
 def extract_item(
@@ -349,20 +337,9 @@ def extract_item(
 ) -> LineItem | None:
     """Pull one item out of a line, or None if the line holds no price."""
     money = _money_tokens(line, profile) if money is None else money
-    if not money:
+    in_column = price_candidates(line, money, block, price_column)
+    if not in_column:
         return None
-
-    # The line total is the rightmost money token in the price column. Falling
-    # back to the rightmost token keeps single-column receipts working.
-    in_column = money
-    if price_column is not None:
-        low, high = price_column
-        margin = 0.03
-        in_column = [
-            (first, last, v)
-            for first, last, v in money
-            if low - margin <= block.fraction(line.words[last].right) <= high + margin
-        ] or money
 
     total_idx, _total_last, total_minor = in_column[-1]
     vat_code: str | None = None
@@ -381,18 +358,10 @@ def extract_item(
     desc_end = resolved.desc_end
     flags = resolved.flags
 
-    # The VAT bracket sits in its own column just left of the price. Removing it
-    # from the description matters more than recording it: the description is what
-    # a budget groups by and what the accuracy figure measures, and every line was
-    # dragging a stray '*c' or '«d' into both.
-    if profile.vat_code_re is not None and total_idx > 0:
-        marker = profile.vat_code_re.fullmatch(line.words[total_idx - 1].text)
-        if marker:
-            # If the profile captures a group, the code is that group. The rest
-            # of the match is the mark in front, which OCR renders differently
-            # every time and which is not worth storing.
-            found = marker.group(1) if marker.groups() else marker.group(0)
-            vat_code = found.strip().lower() or None
+    # The VAT bracket sits just left of the price; keep it out of the description.
+    if total_idx > 0:
+        vat_code = read_vat_code(line.words[total_idx - 1].text, profile)
+        if vat_code is not None:
             desc_end = min(desc_end, total_idx - 1)
 
     desc_words = _strip_leading_noise(line.words[:desc_end])
@@ -400,8 +369,7 @@ def extract_item(
     if not description_raw:
         return None
 
-    # Lowest word confidence in the description. One bad glyph makes the whole
-    # description suspect, so use the minimum rather than the mean.
+    # One bad word makes the whole description suspect.
     confidence = round(min(w.conf for w in desc_words) / 100, 3) if desc_words else 0.0
 
     return LineItem(
@@ -422,12 +390,7 @@ def extract_item(
 def _attach_backwards(
     modifier: Modifier, items: list[LineItem], warnings: list[str]
 ) -> None:
-    """Apply a modifier to the preceding item, or record that it went unused.
-
-    Reached when a modifier did not extend the line that followed it. A store
-    printing modifiers after their item would land here; so would a misread. Either
-    way the modifier must not be silently dropped.
-    """
+    """Apply a modifier to the previous item, or warn that it went unused."""
     if items and modifier.extends_to(items[-1].line_total_minor):
         previous = items[-1]
         previous.quantity = modifier.quantity
@@ -440,14 +403,7 @@ def _attach_backwards(
 def _scan_footer(
     lines: list[Line], profile: Profile
 ) -> tuple[int | None, list[int], int]:
-    """Read the printed total, the amounts tendered, and any change given.
-
-    These sit BELOW the item region, so they need their own pass. The payments are
-    an independent statement of the total, which matters more than it sounds: on a
-    real photograph 'TOTALE EURO 26,44' is set in a large bold face that Tesseract
-    read as 'db, +' at every scale and threshold tried, while the small print of the
-    payment lines came through cleanly and summed to exactly 26,44.
-    """
+    """Read the printed total, the amounts tendered, and any change given."""
     printed_total: int | None = None
     payments: list[int] = []
     change = 0
@@ -484,9 +440,7 @@ def extract(lines: list[Line], profile: Profile) -> Extraction:
     for line in lines[start:end]:
         rule = profile.rule_for(line.text)
 
-        # An allow list rather than a skip list. With a skip list any new rule a
-        # profile adds falls through: a 'change' rule for 'RESTO 0,00' would have
-        # become a zero-euro item.
+        # An allow list, so a new profile rule never turns its lines into items.
         if rule not in ITEM_CANDIDATE_RULES:
             continue
 
@@ -499,15 +453,12 @@ def extract(lines: list[Line], profile: Profile) -> Extraction:
             continue
 
         money = _money_tokens(line, profile)
-        if not money:
-            # Only worth revisiting if there is a description with it; a line of
-            # pure noise is not a lost product.
+        if not money or not price_candidates(line, money, block, column):
+            # No readable price. Lines with a description get a second reading.
             if len(line.words) > 1:
                 skipped.append(line.index)
             continue
 
-        # A negative amount is an adjustment, never a product. Esselunga signs these
-        # with a trailing '-', so this depends on money parsing reading that suffix.
         amount = money[-1][2]
         if amount < 0 or rule == "discount":
             first = min(f for f, _l, _v in money)
@@ -520,7 +471,6 @@ def extract(lines: list[Line], profile: Profile) -> Extraction:
                 pending = None
             continue
 
-        # Attach the pending modifier only if the arithmetic actually works out.
         attach = pending if pending is not None and pending.extends_to(amount) else None
         item = extract_item(line, profile, block, column, attach, money=money)
 

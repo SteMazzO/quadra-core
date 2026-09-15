@@ -1,12 +1,4 @@
-"""Photo or Tesseract TSV in, receipt document out.
-
-The entry point for the library. `parse_tsv` takes Tesseract output directly,
-so the parsing side runs with neither Tesseract nor Pillow installed; the image
-path imports both lazily to keep it that way.
-
-Bad receipt content never raises. A receipt that could not be read comes back
-as a document saying so, so a batch of receipts does not fail on one bad photo.
-"""
+"""Photo or Tesseract TSV in, receipt document out."""
 
 from __future__ import annotations
 
@@ -35,11 +27,7 @@ DEFAULT_OCR_META = {"engine": "tesseract", "lang": "ita", "psm": 4, "oem": 1}
 
 
 def read_input(path: Path | None) -> tuple[str, dict]:
-    """Return TSV plus OCR metadata, from an image, a TSV file, or stdin.
-
-    Taking TSV directly keeps the parsing core usable without Tesseract or
-    Pillow installed; the image branch imports them lazily.
-    """
+    """Return TSV plus OCR metadata, from an image, a TSV file, or stdin."""
     if path is None:
         return sys.stdin.read(), dict(DEFAULT_OCR_META)
 
@@ -68,17 +56,10 @@ def parse_tsv(
     printed_total: int | None = None,
     review: dict[str, Any] | None = None,
 ) -> tuple[dict, str]:
-    """TSV -> receipt document. Never raises on bad receipt content.
+    """Turn TSV into a receipt document. Never raises on bad receipt content.
 
-    `prepared` is the image the TSV was read from. Given one, a receipt that fails
-    to add up gets its price column read a second time; see pipeline.recheck.
-
-    `printed_total` overrides whatever total the receipt itself yielded, for the
-    case where someone typed it in because it was unreadable.
-
-    `review` says whether a person should check this receipt. That is the
-    caller's decision, not this library's, so whatever is passed in is recorded
-    as given.
+    With `prepared`, the image the TSV came from, an unbalanced receipt gets its
+    price column re-read. `printed_total` overrides the total read off the receipt.
     """
     words = drop_speckle(load_tsv(tsv))
     lines = group_lines(words)
@@ -102,8 +83,6 @@ def parse_tsv(
 
     extraction = extract(lines, profile)
     if printed_total is not None:
-        # Someone read the total off the paper because the parser could not, so
-        # it beats anything OCR produced.
         extraction.printed_total_minor = printed_total
         extraction.printed_total_supplied = True
     validation = validate(extraction, profile)
@@ -113,9 +92,8 @@ def parse_tsv(
 
         agreed = recheck.repair(extraction, validation, prepared, profile, lines)
         if agreed is not None:
-            recheck.apply(extraction, agreed, lines)
-            # Re-run the whole check instead of patching the totals, so the
-            # per-line arithmetic and warnings match the new prices.
+            recheck.apply(extraction, agreed, lines, profile)
+            # Validate again from scratch, so the per-line checks see the new prices.
             validation = validate(extraction, profile)
             validation.warnings.append(
                 f"price_column_reread:{len(agreed.changes)}_of_{agreed.disputed}"
@@ -143,18 +121,15 @@ def parse_tsv(
     return doc, validation.status
 
 
-# Below 26px Tesseract starts losing lines, so a second pass at a larger size is
-# worth the time. A receipt at 25px was fine; one at 20px lost two lines.
+# Below this glyph height Tesseract starts losing lines, so read again enlarged.
 SMALL_GLYPH = 26
 COMFORTABLE_GLYPH = 30
 
 
 def _closer(candidate: dict, current: dict) -> bool:
-    """Whether a second reading is the better of the two.
+    """Whether a second reading is better than the current one.
 
-    Balancing wins. Failing that, the smaller delta wins. With no total to
-    compare against, more lines found wins, since a missed line takes its
-    money with it.
+    Balancing wins, then the smaller delta, then more lines found.
     """
     a, b = candidate["totals"], current["totals"]
     if a["balanced"] != b["balanced"]:
@@ -167,12 +142,7 @@ def _closer(candidate: dict, current: dict) -> bool:
 
 
 def _read_larger(prepared, tsv: str, **kwargs):
-    """Read the photo again, enlarged, when the first read came out small.
-
-    Only runs on a receipt that did not add up, so a good one never pays for it.
-    Enlarging adds no detail, but Tesseract's line model does better at the size
-    it expects: on one real receipt it found 33 lines instead of 31.
-    """
+    """Read the photo again, enlarged, if its text came out small; else None."""
     from PIL import Image  # noqa: PLC0415 - the parsing core runs without Pillow
 
     from .pipeline.ocr import run  # noqa: PLC0415
@@ -198,16 +168,13 @@ def parse_image(
     review: dict[str, Any] | None = None,
     printed_total: int | None = None,
 ):
-    """Parse a photo, carrying the raw TSV along for archiving.
+    """Parse a photo into (document, status).
 
-    The document comes back with two private keys, `_tsv` and `_prepared`: the
-    OCR it was built from and the image OCR actually saw. Whoever archives them
-    pops them off first. Item bounding boxes use the prepared image's
-    coordinates, so cropping by box needs that image, not the original photo.
+    The document carries two private keys to pop before storing it: `_tsv`, the OCR
+    it was built from, and `_prepared`, the image whose coordinates item boxes use.
     """
     tsv, ocr_meta = read_input(path)
-    # Removed before parse_tsv: build() copies ocr_meta into the document, and a
-    # PIL image in there makes it unserialisable.
+    # A PIL image in ocr_meta would make the document unserialisable.
     prepared = ocr_meta.pop("_prepared", None)
     shared = {
         "profile_id": profile_id,
@@ -220,13 +187,8 @@ def parse_image(
     if prepared is not None and not document["totals"]["balanced"]:
         second = _read_larger(prepared, tsv, **shared)
         if second is not None and _closer(second[0], document):
-            # The archived image must be the one the TSV describes, or crops on
-            # the review page point at the wrong pixels.
             document, status, tsv, prepared = second
 
-    # Handed to the archiver, which pops both before the document is written.
     document["_tsv"] = tsv
     document["_prepared"] = prepared
     return document, status
-
-
