@@ -10,6 +10,9 @@ import pytest
 
 from quadra_core.pipeline import recheck
 from quadra_core.pipeline.extract import (
+    LineItem,
+    Modifier,
+    _attach,
     _strip_leading_noise,
     extract,
     extract_item,
@@ -61,6 +64,14 @@ def test_receipts_parse_and_balance(name, total):
     assert v.status == "ok", f"warnings: {v.warnings}"
     assert v.balanced and v.delta_minor == 0
     assert v.printed_total_minor == total
+
+
+def test_the_subtotal_is_gross_and_the_computed_total_is_net():
+    """Adding the discounts to the subtotal would count them twice."""
+    ex, v = run("esselunga_b")
+    assert v.items_subtotal_minor == sum(i.line_total_minor for i in ex.items)
+    assert v.computed_total_minor == v.items_subtotal_minor - 720
+    assert v.computed_total_minor == RECEIPT_B_TOTAL
 
 
 def test_item_prices_match_the_paper_receipt():
@@ -674,3 +685,39 @@ def test_recovered_lines_are_named_without_the_price_that_failed(monkeypatch):
     assert "OLIVA FBERIO LT 0,75" in [i.description for i in recovered]
     assert all(i.vat_code for i in recovered)
     assert "SCONTO FIDATY 30%" in [a.label for a in ex.adjustments]
+
+
+def _priced(line_index: int, total: int) -> LineItem:
+    return LineItem(
+        description_raw="THING",
+        description="THING",
+        quantity=Decimal(1),
+        quantity_source="implicit",
+        unit_price_minor=total,
+        line_total_minor=total,
+        vat_code=None,
+        confidence=0.9,
+        line_index=line_index,
+        bbox=(0, 0, 10, 10),
+    )
+
+
+def test_a_modifier_reaches_past_a_discount_to_the_item_it_fits():
+    """A discount line between a modifier and its item is not a wall."""
+    items = [_priced(0, 199), _priced(3, 518)]
+    warnings: list[str] = []
+    _attach(Modifier(Decimal(2), 259, 1), items, esselunga(), warnings)
+
+    assert items[1].quantity == Decimal(2)
+    assert items[1].quantity_source == "modifier"
+    assert items[0].quantity_source == "implicit"
+    assert not warnings
+
+
+def test_a_modifier_that_fits_no_neighbour_is_reported_not_dropped():
+    items = [_priced(0, 500)]
+    warnings: list[str] = []
+    _attach(Modifier(Decimal(3), 100, 1), items, esselunga(), warnings)
+
+    assert items[0].quantity_source == "implicit"
+    assert warnings == ["modifier_unattached:line1"]

@@ -28,10 +28,7 @@ class Report:
 
     source_size: tuple[int, int]
     output_size: tuple[int, int]
-    draft_scale: int = 1
-    cropped: bool = False
     deskew_degrees: float = 0.0
-    flat_fielded: bool = False
     steps: list[str] = field(default_factory=list)
 
 
@@ -42,11 +39,8 @@ def load_grayscale(path: Path, report: Report | None = None) -> Image.Image:
         report.source_size = image.size
 
     # draft() only works before exif_transpose() decodes the image.
-    original_width = image.width
     if image.format == "JPEG":
         image.draft("L", (DRAFT_MIN_WIDTH, DRAFT_MIN_WIDTH))
-        if report is not None and image.width:
-            report.draft_scale = max(1, round(original_width / image.width))
 
     image = ImageOps.exif_transpose(image)
     return image.convert("L")
@@ -179,7 +173,6 @@ def crop_to_paper(image: Image.Image, report: Report | None = None) -> Image.Ima
         return image
 
     if report is not None:
-        report.cropped = True
         report.steps.append(f"crop {image.size}->{(right - left, bottom - top)}")
     return image.crop((left, top, right, bottom))
 
@@ -251,7 +244,6 @@ def flat_field(
     background = image.filter(ImageFilter.BoxBlur(radius))
     corrected = ImageChops.invert(ImageChops.subtract(background, image))
     if report is not None:
-        report.flat_fielded = True
         report.steps.append(f"flat-field r={radius}")
     return corrected
 

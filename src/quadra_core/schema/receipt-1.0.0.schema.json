@@ -67,7 +67,7 @@
             }
           },
           "quantity_source": {
-            "enum": ["parsed", "reconstructed", "modifier", "implicit", "assumed", "missing"]
+            "enum": ["parsed", "reconstructed", "modifier", "implicit"]
           },
           "unit_price_minor": { "type": ["integer", "null"] },
           "line_total_minor": { "type": ["integer", "null"] },
@@ -105,10 +105,19 @@
       "type": "object",
       "required": ["items_subtotal_minor", "balanced"],
       "properties": {
-        "items_subtotal_minor": { "type": "integer" },
-        "discounts_minor": { "type": "integer" },
+        "items_subtotal_minor": {
+          "description": "The line items alone, before discounts.",
+          "type": "integer"
+        },
+        "discounts_minor": {
+          "description": "The adjustments, negative. Already counted in computed_total_minor.",
+          "type": "integer"
+        },
         "printed_total_minor": { "type": ["integer", "null"] },
-        "computed_total_minor": { "type": ["integer", "null"] },
+        "computed_total_minor": {
+          "description": "items_subtotal_minor plus discounts_minor: what the printed total should equal.",
+          "type": ["integer", "null"]
+        },
         "balanced": { "type": "boolean" },
         "delta_minor": { "type": ["integer", "null"] }
       }

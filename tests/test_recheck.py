@@ -33,8 +33,6 @@ def extraction(totals: list[int]) -> Extraction:
         payments_minor=[],
         change_minor=0,
         printed_total_minor=None,
-        item_region=(0, len(totals)),
-        price_column=None,
     )
 
 
@@ -60,7 +58,7 @@ def test_a_single_balancing_reading_is_taken(monkeypatch):
     assert got is not None
     assert got.changes == {0: (7239, 239)}
 
-    recheck.apply(ex, got, [])
+    recheck.apply(ex, got, [], esselunga())
     assert ex.items[0].line_total_minor == 239
     assert "price_reread" in ex.items[0].flags
 
@@ -68,7 +66,7 @@ def test_a_single_balancing_reading_is_taken(monkeypatch):
 def test_a_repaired_line_carries_its_unit_price_with_it(monkeypatch):
     """The unit price moves with the corrected total."""
     ex, got = repair_with([7239, 299, 239], 777, {0: 239}, monkeypatch)
-    recheck.apply(ex, got, [])
+    recheck.apply(ex, got, [], esselunga())
     assert ex.items[0].unit_price_minor == 239
 
 
@@ -79,7 +77,7 @@ def test_a_quantity_from_a_modifier_keeps_its_unit_price(monkeypatch):
     ex.items[0].unit_price_minor = 100
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: {0: [239]})
     got = recheck.repair(ex, validation(239, 7000), object(), object(), [])
-    recheck.apply(ex, got, [])
+    recheck.apply(ex, got, [], esselunga())
     assert ex.items[0].unit_price_minor == 100
 
 
@@ -140,7 +138,7 @@ def test_a_recovered_line_does_not_shift_the_other_corrections():
         Line(words=[Word("BREAD", 0, 90, 50, 10, 90.0)], index=9),
     ]
     result = recheck.Repair(changes={9: (250, 999)}, recovered={7: 50}, disputed=2)
-    recheck.apply(ex, result, lines)
+    recheck.apply(ex, result, lines, esselunga())
 
     by_line = {i.line_index: i.line_total_minor for i in ex.items}
     assert by_line == {5: 100, 7: 50, 9: 999}
@@ -260,7 +258,7 @@ def test_a_stray_description_word_does_not_widen_the_column():
     ]
     for index, line in enumerate(lines):
         line.index = index
-    assert recheck._column_left(lines, ex) == 798
+    assert recheck.survey(lines, ex).left == 798
 
 
 def test_a_sign_in_the_column_marks_a_discount_the_label_hid(monkeypatch):

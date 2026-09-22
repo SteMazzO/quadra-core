@@ -39,7 +39,6 @@ class Profile:
     modifier_re: re.Pattern[str] | None
     modifier_position: str
     money_re: re.Pattern[str]
-    quantity_re: re.Pattern[str]
     vat_code_re: re.Pattern[str] | None
     fingerprint: tuple[str, ...]
     min_ratio: float
@@ -115,7 +114,6 @@ def load(path: Path) -> Profile:
         ),
         modifier_position=_modifier_position(layout, path),
         money_re=_compile(fmt["money"], "format.money"),
-        quantity_re=_compile(fmt.get("quantity", r"\d+"), "format.quantity"),
         vat_code_re=(
             _compile(fmt["vat_code"], "format.vat_code")
             if fmt.get("vat_code")

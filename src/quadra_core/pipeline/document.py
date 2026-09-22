@@ -121,7 +121,7 @@ def build(
             "items_subtotal_minor": validation.items_subtotal_minor,
             "discounts_minor": sum(a.amount_minor for a in extraction.adjustments),
             "printed_total_minor": validation.printed_total_minor,
-            "computed_total_minor": validation.items_subtotal_minor,
+            "computed_total_minor": validation.computed_total_minor,
             "balanced": validation.balanced,
             "delta_minor": validation.delta_minor,
         },

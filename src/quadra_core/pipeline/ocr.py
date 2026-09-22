@@ -59,8 +59,17 @@ def _base_flags(psm: int, oem: int, lang: str) -> list[str]:
     ]
 
 
-def _limit_memory() -> None:
-    resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT_BYTES, MEMORY_LIMIT_BYTES))
+def _limit_memory(pid: int) -> bool:
+    """Cap a running child's address space. Returns whether the cap was set."""
+    prlimit = getattr(resource, "prlimit", None)
+    if prlimit is None:  # pragma: no cover - not Linux
+        return False
+    try:
+        prlimit(pid, resource.RLIMIT_AS, (MEMORY_LIMIT_BYTES, MEMORY_LIMIT_BYTES))
+    except (ProcessLookupError, PermissionError):
+        # It already exited, or it is not ours to limit.
+        return False
+    return True
 
 
 @functools.lru_cache(maxsize=1)
@@ -111,27 +120,31 @@ def run(
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
 
+    command = [tesseract_path(), "-", "-", *_base_flags(psm, oem, lang), "tsv"]
     try:
-        completed = subprocess.run(
-            [tesseract_path(), "-", "-", *_base_flags(psm, oem, lang), "tsv"],
-            input=buffer.getvalue(),
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            preexec_fn=_limit_memory,
+        with subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=_child_env(threads),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise OcrError(f"tesseract timed out after {timeout}s") from exc
+        ) as child:
+            _limit_memory(child.pid)
+            try:
+                stdout, stderr = child.communicate(buffer.getvalue(), timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                child.kill()
+                child.communicate()
+                raise OcrError(f"tesseract timed out after {timeout}s") from exc
     except OSError as exc:
         raise OcrError(f"could not run tesseract: {exc}") from exc
 
-    if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", "replace").strip()
-        raise OcrError(f"tesseract failed ({completed.returncode}): {detail}")
+    if child.returncode != 0:
+        detail = stderr.decode("utf-8", "replace").strip()
+        raise OcrError(f"tesseract failed ({child.returncode}): {detail}")
 
     return OcrResult(
-        tsv=completed.stdout.decode("utf-8", "replace"),
+        tsv=stdout.decode("utf-8", "replace"),
         psm=psm,
         oem=oem,
         lang=lang,

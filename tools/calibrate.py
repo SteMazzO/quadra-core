@@ -125,6 +125,7 @@ def report_validation(result) -> None:
     """Print the arithmetic verdict."""
     print(f"{RULE}\nVALIDATION  status={result.status}")
     print(f"  items subtotal   {format_minor(result.items_subtotal_minor):>10}")
+    print(f"  computed total   {format_minor(result.computed_total_minor):>10}")
     printed = result.printed_total_minor
     shown = format_minor(printed) if printed is not None else "NOT FOUND"
     print(f"  printed total    {shown:>10}")

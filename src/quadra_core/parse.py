@@ -110,7 +110,7 @@ def parse_tsv(
         validation=validation,
         profile=profile,
         profile_confidence=confidence,
-        ocr_meta=ocr_meta or {"engine": "tesseract", "lang": "ita", "psm": 4, "oem": 1},
+        ocr_meta=ocr_meta or dict(DEFAULT_OCR_META),
         source={"ingested_at": datetime.now(UTC).isoformat()},
         review=(
             review
@@ -138,7 +138,7 @@ def _closer(candidate: dict, current: dict) -> bool:
         return abs(a["delta_minor"]) < abs(b["delta_minor"])
     if (a["printed_total_minor"] is None) != (b["printed_total_minor"] is None):
         return b["printed_total_minor"] is None
-    return len(a and candidate["line_items"]) > len(current["line_items"])
+    return len(candidate["line_items"]) > len(current["line_items"])
 
 
 def _read_larger(prepared, tsv: str, **kwargs):

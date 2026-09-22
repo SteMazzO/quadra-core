@@ -31,7 +31,7 @@ _STRIP = re.compile(r"[^0-9.,]")
 
 # A trailing minus, as in Esselunga's '7,20-S'. Any character may follow the dash,
 # since OCR sometimes reads that S as a digit.
-_TRAILING_SIGN = re.compile(r"-\s*[^\s]?\s*$")
+TRAILING_SIGN = re.compile(r"-\s*[^\s]?\s*$")
 
 # Anything longer is garbage, and could overflow Decimal's default precision.
 MAX_NUMERIC_LEN = 20
@@ -46,7 +46,7 @@ def normalize_separators(token: str, separator: str = ",") -> str:
     """Rewrite lookalike separators, including doubled ones, as `separator`."""
     if not token:
         return token
-    sign = _TRAILING_SIGN.search(token)
+    sign = TRAILING_SIGN.search(token)
     suffix = sign.group(0) if sign else ""
     core = token[: sign.start()] if sign else token
     return _SEPARATOR_RUN.sub(separator, core) + suffix
@@ -54,7 +54,7 @@ def normalize_separators(token: str, separator: str = ",") -> str:
 
 def strip_sign(token: str) -> str:
     """Strip a leading or trailing sign, and any VAT letter after it."""
-    return _TRAILING_SIGN.sub("", token).lstrip("-").strip()
+    return TRAILING_SIGN.sub("", token).lstrip("-").strip()
 
 
 def digit_ratio(token: str) -> float:
@@ -83,8 +83,8 @@ def parse_money(
     if not token:
         return None
 
-    negative = bool(_TRAILING_SIGN.search(token)) or token.lstrip().startswith("-")
-    token = _TRAILING_SIGN.sub("", token).lstrip("-")
+    negative = bool(TRAILING_SIGN.search(token)) or token.lstrip().startswith("-")
+    token = TRAILING_SIGN.sub("", token).lstrip("-")
 
     if repair and digit_ratio(token) >= min_digit_ratio:
         candidate = repair_numeric(token)
@@ -100,7 +100,6 @@ def parse_money(
     if places:
         tail = re.search(r"[.,](\d+)$", candidate)
         if tail and len(tail.group(1)) == places:
-            _point = candidate[tail.start()]
             candidate = candidate[: tail.start()].replace(",", "").replace(".", "")
             candidate = f"{candidate or '0'}.{tail.group(1)}"
         elif tail:

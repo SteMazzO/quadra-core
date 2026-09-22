@@ -1,8 +1,11 @@
 """Regenerate the rendered test fixtures. Needs Pillow and Tesseract.
 
-Usage:  python3 tools/make_fixtures.py
+Usage:  python3 tools/make_fixtures.py [--out DIR]
 """
 
+from __future__ import annotations
+
+import argparse
 import random
 import subprocess
 import tempfile
@@ -10,7 +13,12 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
-LH, W = 34, 1000
+FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+LINE_HEIGHT, WIDTH = 34, 1000
+FIXTURES = (
+    Path(__file__).resolve().parent.parent / "src" / "quadra_core" / "testdata" / "ocr"
+)
+
 ITEMS = [
     ("LATTE INTERO 1L", "2", "1,49", "2,98"),
     ("PANE INTEGRALE", "1", "2,30", "2,30"),
@@ -21,35 +29,23 @@ ITEMS = [
     ("OLIO EXTRAV. 1L", "1", "7,90", "7,90"),
     ("PASTA PENNE 500G", "4", "0,89", "3,56"),
 ]
+TOTAL = "32,02"
 
 
-def build(total, out, faded=False, seed=7):
-    """Render a synthetic receipt and run Tesseract to produce the fixture TSV."""
-    random.seed(seed)
-    lines = ["SUPERMERCATO PROVA", "VIA ROMA 00 - CITTA", "", "SCONTRINO N. 0042", ""]
-    lines += [f"{d:<28}{q:>6} {u:>7} {t:>8}" for d, q, u, t in ITEMS]
-    lines += [
+def synthetic(total: str) -> list[str]:
+    """Build a four-column receipt: description, quantity, unit price, total."""
+    return [
+        "SUPERMERCATO PROVA",
+        "VIA ROMA 00 - CITTA",
+        "",
+        "SCONTRINO N. 0042",
+        "",
+        *[f"{d:<28}{q:>6} {u:>7} {t:>8}" for d, q, u, t in ITEMS],
         "",
         f"{'TOTALE COMPLESSIVO':<28}{'':>6} {'':>7} {total:>8}",
         "",
         "ARRIVEDERCI E GRAZIE",
     ]
-    img = Image.new("L", (W, LH * len(lines) + 80), 255)
-    d = ImageDraw.Draw(img)
-    f = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 26)
-    for i, l in enumerate(lines):
-        d.text((40, 40 + i * LH), l, font=f, fill=30)
-    if faded:
-        img = (
-            ImageEnhance.Contrast(img)
-            .enhance(0.35)
-            .filter(ImageFilter.GaussianBlur(0.9))
-        )
-        px = img.load()
-        for _ in range(img.size[0] * img.size[1] // 12):
-            x, y = random.randrange(img.size[0]), random.randrange(img.size[1])
-            px[x, y] = max(0, min(255, px[x, y] + random.randint(-45, 45)))
-    img.save(out)
 
 
 # Transcribed from two real Esselunga receipts, rendered rather than photographed.
@@ -105,95 +101,87 @@ ESSELUNGA_B = [
     f"{'SALDO PUNTI':<24}{'0.000':>8}",
 ]
 
-OUT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "ocr"
-TOTAL = "32,02"
-
-VARIANTS = [
-    ("synthetic_clean", TOTAL, False, 7),
-    ("synthetic_faded", TOTAL, True, 11),
+# name, lines, contrast (1.0 leaves it alone), blur radius, noise divisor, seed.
+FIXTURE_SET = [
+    ("synthetic_clean", synthetic(TOTAL), 1.0, 0.0, 0, 7),
+    ("synthetic_faded", synthetic(TOTAL), 0.35, 0.9, 12, 11),
     # Printed total 1,00 below the items, so the arithmetic check must fail.
-    ("synthetic_unbalanced", "31,02", False, 7),
+    ("synthetic_unbalanced", synthetic("31,02"), 1.0, 0.0, 0, 7),
+    ("esselunga_a", ESSELUNGA_A, 1.0, 0.0, 0, 3),
+    ("esselunga_b", ESSELUNGA_B, 1.0, 0.0, 0, 5),
+    ("esselunga_b_faded", ESSELUNGA_B, 0.45, 0.8, 16, 13),
 ]
 
 
-def render(lines, out, faded=False, seed=7):
-    """Render arbitrary receipt text, optionally degraded."""
+def render(
+    lines: list[str],
+    out: Path,
+    *,
+    contrast: float = 1.0,
+    blur: float = 0.0,
+    noise: int = 0,
+    seed: int = 7,
+) -> None:
+    """Render receipt text to an image, optionally degraded."""
     random.seed(seed)
-    img = Image.new("L", (W, LH * len(lines) + 80), 255)
-    d = ImageDraw.Draw(img)
-    f = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 26)
-    for i, l in enumerate(lines):
-        d.text((40, 40 + i * LH), l, font=f, fill=30)
-    if faded:
-        img = ImageEnhance.Contrast(img).enhance(0.45)
-        img = img.filter(ImageFilter.GaussianBlur(0.8))
-        px = img.load()
-        for _ in range(img.size[0] * img.size[1] // 16):
-            x, y = random.randrange(img.size[0]), random.randrange(img.size[1])
-            px[x, y] = max(0, min(255, px[x, y] + random.randint(-40, 40)))
-    img.save(out)
+    image = Image.new("L", (WIDTH, LINE_HEIGHT * len(lines) + 80), 255)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype(FONT, 26)
+    for i, line in enumerate(lines):
+        draw.text((40, 40 + i * LINE_HEIGHT), line, font=font, fill=30)
+
+    if contrast != 1.0:
+        image = ImageEnhance.Contrast(image).enhance(contrast)
+    if blur:
+        image = image.filter(ImageFilter.GaussianBlur(blur))
+    if noise:
+        pixels = image.load()
+        for _ in range(image.size[0] * image.size[1] // noise):
+            x, y = random.randrange(image.size[0]), random.randrange(image.size[1])
+            pixels[x, y] = max(0, min(255, pixels[x, y] + random.randint(-45, 45)))
+    image.save(out)
 
 
-ESSELUNGA_VARIANTS = [
-    ("esselunga_a", ESSELUNGA_A, False, 3),
-    ("esselunga_b", ESSELUNGA_B, False, 5),
-    ("esselunga_b_faded", ESSELUNGA_B, True, 13),
-]
+def ocr(png: Path, out_base: Path) -> None:
+    """Write out_base.tsv, with the flags the parser expects fixtures to carry."""
+    subprocess.run(
+        [
+            "tesseract",
+            str(png),
+            str(out_base),
+            "--oem",
+            "1",
+            "--psm",
+            "4",
+            "-l",
+            "ita",
+            "-c",
+            "preserve_interword_spaces=1",
+            "tsv",
+        ],
+        check=True,
+        capture_output=True,
+        env={"OMP_THREAD_LIMIT": "1", "PATH": "/usr/bin:/bin"},
+    )
 
 
-def main() -> None:
-    """Regenerate the synthetic test fixtures."""
+def main(argv: list[str] | None = None) -> None:
+    """Render every fixture and OCR it."""
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--out", type=Path, default=FIXTURES, help="where to write them")
+    args = ap.parse_args(argv)
+
     assert sum(int(t.replace(",", "")) for *_, t in ITEMS) == int(
         TOTAL.replace(",", "")
     ), "ITEMS no longer sum to TOTAL, fix the constant rather than hardcoding a total"
-    with tempfile.TemporaryDirectory() as tmp:
-        for name, total, faded, seed in VARIANTS:
-            png = Path(tmp) / f"{name}.png"
-            build(total, png, faded=faded, seed=seed)
-            subprocess.run(
-                [
-                    "tesseract",
-                    str(png),
-                    str(OUT / name),
-                    "--oem",
-                    "1",
-                    "--psm",
-                    "4",
-                    "-l",
-                    "ita",
-                    "-c",
-                    "preserve_interword_spaces=1",
-                    "tsv",
-                ],
-                check=True,
-                capture_output=True,
-                env={"OMP_THREAD_LIMIT": "1", "PATH": "/usr/bin:/bin"},
-            )
-            print(f"wrote {OUT / (name + '.tsv')}")
 
-        for name, lines, faded, seed in ESSELUNGA_VARIANTS:
+    args.out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, lines, contrast, blur, noise, seed in FIXTURE_SET:
             png = Path(tmp) / f"{name}.png"
-            render(lines, png, faded=faded, seed=seed)
-            subprocess.run(
-                [
-                    "tesseract",
-                    str(png),
-                    str(OUT / name),
-                    "--oem",
-                    "1",
-                    "--psm",
-                    "4",
-                    "-l",
-                    "ita",
-                    "-c",
-                    "preserve_interword_spaces=1",
-                    "tsv",
-                ],
-                check=True,
-                capture_output=True,
-                env={"OMP_THREAD_LIMIT": "1", "PATH": "/usr/bin:/bin"},
-            )
-            print(f"wrote {OUT / (name + '.tsv')}")
+            render(lines, png, contrast=contrast, blur=blur, noise=noise, seed=seed)
+            ocr(png, args.out / name)
+            print(f"wrote {args.out / (name + '.tsv')}")
 
 
 if __name__ == "__main__":

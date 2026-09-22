@@ -6,7 +6,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from quadra_core.pipeline.extract import (
     Adjustment,
@@ -67,35 +67,43 @@ class Repair:
         return bool(self.changes) or bool(self.recovered)
 
 
-def _price_words(lines: list[Line], extraction: Extraction) -> dict[int, Word]:
-    """Return the rightmost normal-height word of each item and dropped line."""
+class Column(NamedTuple):
+    """Where the prices sit on the page, measured once per receipt."""
+
+    # Line index -> the rightmost word of normal height, i.e. where its price is.
+    prices: dict[int, Word]
+    # Left edge of the price column in page pixels, or None if no line had a price.
+    left: int | None
+    glyph: float
+
+
+def survey(lines: list[Line], extraction: Extraction) -> Column:
+    """Locate the price of every item and dropped line, and the column they form."""
     by_index = {line.index: line for line in lines}
     glyph = median_glyph_height([w for line in lines for w in line.words])
-    wanted = [item.line_index for item in extraction.items]
-    wanted += extraction.skipped_lines
-    out = {}
-    for index in wanted:
+
+    prices: dict[int, Word] = {}
+    for index in [i.line_index for i in extraction.items] + extraction.skipped_lines:
         line = by_index.get(index)
         if not line or not line.words:
             continue
+        # Words spanning two rows are skipped: a dropped line is usually dropped
+        # because its price came back as one of those.
         sane = [w for w in line.words if w.height <= glyph * _MERGED_ROW_RATIO]
-        out[index] = max(sane or line.words, key=lambda w: w.right)
-    return out
+        prices[index] = max(sane or line.words, key=lambda w: w.right)
 
-
-def _column_left(lines: list[Line], extraction: Extraction) -> int | None:
-    """Return the price column's left edge in pixels, ignoring stray words."""
-    words = _price_words(lines, extraction)
+    # The left edge comes from the largest cluster, so one line offering only a
+    # description word cannot widen the column to the whole page.
     lefts = [
-        float(words[item.line_index].left)
-        for item in extraction.items
-        if item.line_index in words
+        float(prices[i.line_index].left)
+        for i in extraction.items
+        if i.line_index in prices
     ]
-    if not lefts:
-        return None
-    glyph = median_glyph_height([w for line in lines for w in line.words]) or 1.0
-    largest = max(cluster_1d(lefts, gap=glyph), key=lambda c: (len(c), c[0]))
-    return int(min(largest))
+    left = None
+    if lefts:
+        clusters = cluster_1d(lefts, gap=glyph or 1.0)
+        left = int(min(max(clusters, key=lambda c: (len(c), c[0]))))
+    return Column(prices, left, glyph)
 
 
 def _column_rows(
@@ -135,32 +143,54 @@ def _assign(
 
 
 def second_opinion(
-    prepared: Any, lines: list[Line], extraction: Extraction, profile: Profile
+    prepared: Any, column: Column, profile: Profile
 ) -> dict[int, list[int]]:
     """Read the price column on its own, several ways: line index -> amounts."""
-    words = _price_words(lines, extraction)
-    if not words:
+    if not column.prices:
         return {}
 
-    column_left = _column_left(lines, extraction)
-    if column_left is None:
-        column_left = min(w.left for w in words.values())
-    left = max(0, column_left - PAD)
-    right = min(prepared.width, max(w.right for w in words.values()) + PAD)
+    left = max(0, (column.left or min(w.left for w in column.prices.values())) - PAD)
+    right = min(prepared.width, max(w.right for w in column.prices.values()) + PAD)
     if right - left < 1:
         return {}
 
-    positions = {index: word.cy for index, word in words.items()}
-    tolerance = median_glyph_height([w for line in lines for w in line.words])
-
+    positions = {index: word.cy for index, word in column.prices.items()}
     out: dict[int, list[int]] = {}
     for scale, psm in READINGS:
         rows = _column_rows(prepared, left, right, scale, psm)
-        for index, text in _assign(rows, positions, tolerance).items():
+        for index, text in _assign(rows, positions, column.glyph).items():
             amount = parse_amount(text, profile)
             if amount is not None:
                 out.setdefault(index, []).append(amount)
     return out
+
+
+def _item_votes(item: LineItem, readings: list[int]) -> Counter[int]:
+    """Return what this item's price might be: the first pass, plus each reading."""
+    votes = Counter(readings)
+    votes[item.line_total_minor or 0] += 1
+    if not _NAMED.search(item.description):
+        # Maybe a neighbour's price on a row of its own, so allow dropping it.
+        votes.setdefault(0, 0)
+    return votes
+
+
+def _dropped_votes(
+    line: Line | None, readings: list[int], profile: Profile
+) -> Counter[int]:
+    """Return what a dropped line might hold: nothing, or what the column read."""
+    # A discount by its label, or by a minus sign in any reading.
+    discount = any(amount < 0 for amount in readings) or (
+        line is not None and profile.rule_for(line.text) == "discount"
+    )
+    votes = Counter(
+        -abs(amount) if discount else amount
+        for amount in readings
+        if discount or amount > 0
+    )
+    if votes:
+        votes.setdefault(0, 0)
+    return votes
 
 
 def _leader(votes: Counter[int]) -> int | None:
@@ -170,9 +200,13 @@ def _leader(votes: Counter[int]) -> int | None:
     return leaders[0] if len(leaders) == 1 else None
 
 
-# A cell of _choose's table: rank, ways to reach it (capped at 2), previous sum,
-# amount taken. Rank is (-lines overruled, votes), so higher is better.
-_Entry = tuple[tuple[int, int], int, int, int]
+class _Cell(NamedTuple):
+    """One running sum in _choose's table."""
+
+    rank: tuple[int, int]  # (-lines overruled, votes), so higher is better
+    ways: int  # how many ways reach that rank, counted up to 2
+    previous: int  # the running sum this came from
+    amount: int  # the amount taken to get here
 
 
 def _choose(slots: list[Counter[int]], target: int) -> list[int] | None:
@@ -180,36 +214,55 @@ def _choose(slots: list[Counter[int]], target: int) -> list[int] | None:
 
     Prefers the fewest overruled majorities, then the most votes.
     """
-    tables: list[dict[int, _Entry]] = []
-    current: dict[int, _Entry] = {0: ((0, 0), 1, 0, 0)}
+    tables: list[dict[int, _Cell]] = []
+    current = {0: _Cell((0, 0), 1, 0, 0)}
     for votes in slots:
         leader = _leader(votes)
-        following: dict[int, _Entry] = {}
-        for running, (rank, ways, _previous, _amount) in current.items():
+        following: dict[int, _Cell] = {}
+        for running, cell in current.items():
             for amount, count in votes.items():
                 overruled = int(leader is not None and amount != leader)
-                candidate = (rank[0] - overruled, rank[1] + count)
-                if -candidate[0] > MAX_OVERRULED:
+                rank = (cell.rank[0] - overruled, cell.rank[1] + count)
+                if -rank[0] > MAX_OVERRULED:
                     continue
                 key = running + amount
                 held = following.get(key)
-                if held is None or candidate > held[0]:
-                    following[key] = (candidate, ways, running, amount)
-                elif candidate == held[0]:
-                    following[key] = (held[0], min(2, held[1] + ways), *held[2:])
+                if held is None or rank > held.rank:
+                    following[key] = _Cell(rank, cell.ways, running, amount)
+                elif rank == held.rank:
+                    following[key] = held._replace(ways=min(2, held.ways + cell.ways))
         tables.append(following)
         current = following
 
     end = current.get(target)
-    if end is None or end[1] > 1:
+    if end is None or end.ways > 1:
         return None
     chosen = []
     running = target
     for table in reversed(tables):
-        _score, _ways, previous, amount = table[running]
-        chosen.append(amount)
-        running = previous
+        cell = table[running]
+        chosen.append(cell.amount)
+        running = cell.previous
     return chosen[::-1]
+
+
+def _slots(
+    extraction: Extraction,
+    readings: dict[int, list[int]],
+    lines: list[Line],
+    profile: Profile,
+) -> list[tuple[int, Counter[int]]]:
+    """One slot of candidate amounts per item, and per line that lost its price."""
+    by_index = {line.index: line for line in lines}
+    slots = [
+        (item.line_index, _item_votes(item, readings.get(item.line_index, [])))
+        for item in extraction.items
+    ]
+    for index in extraction.skipped_lines:
+        votes = _dropped_votes(by_index.get(index), readings.get(index, []), profile)
+        if votes:
+            slots.append((index, votes))
+    return slots
 
 
 def repair(
@@ -224,48 +277,26 @@ def repair(
     if target is None or validation.delta_minor == 0 or not extraction.items:
         return None
 
-    readings = second_opinion(prepared, lines, extraction, profile)
+    column = survey(lines, extraction)
+    readings = second_opinion(prepared, column, profile)
     if not readings:
         return None
 
-    by_index = {line.index: line for line in lines}
-    slots: list[tuple[int, Counter[int]]] = []
-    for item in extraction.items:
-        votes = Counter(readings.get(item.line_index, []))
-        votes[item.line_total_minor or 0] += 1
-        if not _NAMED.search(item.description):
-            # Maybe a neighbour's price on a row of its own, so allow dropping it.
-            votes.setdefault(0, 0)
-        slots.append((item.line_index, votes))
-    for line_index in extraction.skipped_lines:
-        line = by_index.get(line_index)
-        read = readings.get(line_index, [])
-        # A discount by its label, or by a minus sign in any reading.
-        discount = any(amount < 0 for amount in read) or (
-            line is not None and profile.rule_for(line.text) == "discount"
-        )
-        votes = Counter(
-            -abs(amount) if discount else amount
-            for amount in read
-            if discount or amount > 0
-        )
-        if votes:
-            votes.setdefault(0, 0)
-            slots.append((line_index, votes))
-
+    slots = _slots(extraction, readings, lines, profile)
     disputed = [(index, votes) for index, votes in slots if len(votes) > 1]
     if not disputed or len(disputed) > MAX_DISPUTED:
         return None
 
     settled = sum(next(iter(votes)) for _index, votes in slots if len(votes) == 1)
     adjustments = sum(a.amount_minor for a in extraction.adjustments)
-    remaining = target - settled - adjustments
-    chosen = _choose([votes for _index, votes in disputed], remaining)
+    chosen = _choose(
+        [votes for _index, votes in disputed], target - settled - adjustments
+    )
     if chosen is None:
         return None
 
     first = {item.line_index: item.line_total_minor for item in extraction.items}
-    result = Repair(disputed=len(disputed), column_left=_column_left(lines, extraction))
+    result = Repair(disputed=len(disputed), column_left=column.left)
     for (index, _votes), amount in zip(disputed, chosen, strict=True):
         if index not in first:
             # A dropped line; zero means leave it dropped.
@@ -277,13 +308,13 @@ def repair(
 
 
 def _describing_words(
-    line: Line, column_left: int | None, profile: Profile | None
+    line: Line, column_left: int | None, profile: Profile
 ) -> tuple[list[Word], str | None]:
     """Return a recovered line's words left of the price column, and its VAT code."""
     words = [
         w for w in line.words if column_left is None or w.cx < column_left
     ] or line.words
-    if profile is not None and len(words) > 1:
+    if len(words) > 1:
         vat_code = read_vat_code(words[-1].text, profile)
         if vat_code is not None:
             return words[:-1], vat_code
@@ -310,13 +341,10 @@ def _recovered_item(
     )
 
 
-def apply(
-    extraction: Extraction,
-    result: Repair,
-    lines: list[Line],
-    profile: Profile | None = None,
+def _recover(
+    extraction: Extraction, result: Repair, lines: list[Line], profile: Profile
 ) -> None:
-    """Write the agreed prices back, and flag everything that moved."""
+    """Add back the lines the first pass dropped, as items or as discounts."""
     by_index = {line.index: line for line in lines}
     for line_index, amount in sorted(result.recovered.items()):
         line = by_index.get(line_index)
@@ -330,12 +358,20 @@ def apply(
             )
         else:
             extraction.items.append(_recovered_item(line, words, amount, vat_code))
+
+    extraction.items.sort(key=lambda i: i.line_index)
+    extraction.adjustments.sort(key=lambda a: a.line_index)
+    extraction.skipped_lines = [
+        i for i in extraction.skipped_lines if i not in result.recovered
+    ]
+
+
+def apply(
+    extraction: Extraction, result: Repair, lines: list[Line], profile: Profile
+) -> None:
+    """Write the agreed prices back, and flag everything that moved."""
     if result.recovered:
-        extraction.items.sort(key=lambda i: i.line_index)
-        extraction.adjustments.sort(key=lambda a: a.line_index)
-        extraction.skipped_lines = [
-            i for i in extraction.skipped_lines if i not in result.recovered
-        ]
+        _recover(extraction, result, lines, profile)
 
     by_item = {item.line_index: item for item in extraction.items}
     for line_index, (_was, now) in result.changes.items():
