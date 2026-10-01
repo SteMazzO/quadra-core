@@ -1,10 +1,4 @@
-"""The parsing side must not import Pillow.
-
-Pillow is a required dependency, so this is not about running without it. It is
-about import cost: Pillow takes a few hundred milliseconds to load on a Pi Zero
-2W, and parsing a TSV has no reason to pay that. This keeps the image imports
-lazy.
-"""
+"""Parsing TSV must not import Pillow, which is slow to load on small devices."""
 
 from __future__ import annotations
 
@@ -31,11 +25,8 @@ def test_tsv_parses_without_pillow(no_pillow):
     # Imported inside the guard so the import itself is what gets checked.
     from quadra_core import parse_tsv  # noqa: PLC0415
 
-    doc, status = parse_tsv(
-        (FIXTURES / "esselunga_b.tsv").read_text(),
-        profile_id="esselunga",
-        receipt_id="iso",
-    )
-    assert status == "ok"
+    result = parse_tsv((FIXTURES / "esselunga_b.tsv").read_text(), profile="esselunga")
+    doc = result.document
+    assert result.status == "ok"
     assert len(doc["line_items"]) == 9
     assert doc["adjustments"][0]["amount_minor"] == -720

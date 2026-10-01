@@ -1,22 +1,13 @@
-"""Photo or Tesseract TSV in, receipt document out.
-
-The entry point for the library. `parse_tsv` takes Tesseract output directly,
-so the parsing side runs with neither Tesseract nor Pillow installed; the image
-path imports both lazily to keep it that way.
-
-Bad receipt content never raises. A receipt that could not be read comes back
-as a document saying so, so a batch of receipts does not fail on one bad photo.
-"""
+"""Photo or Tesseract TSV in, receipt document out."""
 
 from __future__ import annotations
 
-import sys
-import uuid
-from datetime import UTC, datetime
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from quadra_core.pipeline import document as document_module
+from quadra_core.pipeline import recheck
 from quadra_core.pipeline.document import build
 from quadra_core.pipeline.extract import extract
 from quadra_core.pipeline.lines import (
@@ -25,208 +16,165 @@ from quadra_core.pipeline.lines import (
     load_tsv,
     median_glyph_height,
 )
-from quadra_core.pipeline.ocr import run_on_path
 from quadra_core.pipeline.validate import validate
 from quadra_core.profiles import loader
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
-DEFAULT_OCR_META = {"engine": "tesseract", "lang": "ita", "psm": 4, "oem": 1}
+
+@dataclass(frozen=True, slots=True)
+class Result:
+    """A parsed receipt, and the OCR and image it was read from."""
+
+    document: dict[str, Any]
+    tsv: str
+    image: Any = None
+
+    @property
+    def status(self) -> str:
+        """'ok', 'review' or 'failed'. With 'review', see document['review']."""
+        return self.document["status"]
 
 
-def read_input(path: Path | None) -> tuple[str, dict]:
-    """Return TSV plus OCR metadata, from an image, a TSV file, or stdin.
-
-    Taking TSV directly keeps the parsing core usable without Tesseract or
-    Pillow installed; the image branch imports them lazily.
-    """
-    if path is None:
-        return sys.stdin.read(), dict(DEFAULT_OCR_META)
-
-    if path.suffix.lower() in IMAGE_SUFFIXES:
-        result, report, prepared = run_on_path(path)
-        return result.tsv, {
-            "engine": "tesseract",
-            "engine_version": result.engine_version,
-            "lang": result.lang,
-            "psm": result.psm,
-            "oem": result.oem,
-            "preprocessing": report.steps,
-            "_prepared": prepared,
-        }
-
-    return path.read_text(), dict(DEFAULT_OCR_META)
+def _profile(profile: str | None, texts: list[str]) -> loader.Profile:
+    if profile:
+        for candidate in loader.available():
+            if candidate.id == profile:
+                return candidate
+        raise loader.ProfileError(f"no such profile: {profile}")
+    selected = loader.select(texts)
+    if selected is None:
+        raise loader.ProfileError(
+            "could not tell which shop this receipt is from; pass profile=... "
+            "(see `quadra-core profiles`)"
+        )
+    return selected[0]
 
 
 def parse_tsv(
     tsv: str,
     *,
-    profile_id: str | None,
-    receipt_id: str | None = None,
-    ocr_meta: dict | None = None,
-    prepared: object | None = None,
-    printed_total: int | None = None,
-    review: dict[str, Any] | None = None,
-) -> tuple[dict, str]:
-    """TSV -> receipt document. Never raises on bad receipt content.
+    profile: str | None = None,
+    total: int | None = None,
+    image: Any = None,
+    ocr: dict[str, Any] | None = None,
+) -> Result:
+    """Turn Tesseract TSV into a receipt. Never raises on a hard-to-read receipt.
 
-    `prepared` is the image the TSV was read from. Given one, a receipt that fails
-    to add up gets its price column read a second time; see pipeline.recheck.
-
-    `printed_total` overrides whatever total the receipt itself yielded, for the
-    case where someone typed it in because it was unreadable.
-
-    `review` says whether a person should check this receipt. That is the
-    caller's decision, not this library's, so whatever is passed in is recorded
-    as given.
+    `profile` names the shop; without it the shop is recognised from the text.
+    `total` is the receipt total in minor units, for when a person has read it.
+    `image`, the image the TSV came from, lets an unbalanced receipt have its
+    price column read again.
     """
-    words = drop_speckle(load_tsv(tsv))
-    lines = group_lines(words)
-    texts = [l.text for l in lines]
+    if total is not None and total <= 0:
+        raise ValueError(f"total must be positive minor units, got {total}")
 
-    confidence = 0.0
-    if profile_id:
-        matches = [p for p in loader.available() if p.id == profile_id]
-        if not matches:
-            raise loader.ProfileError(f"no such profile: {profile_id}")
-        profile = matches[0]
-        confidence = 1.0
-    else:
-        selected = loader.select(texts)
-        if selected is None:
-            raise loader.ProfileError(
-                "no profile fingerprint matched. That is a real signal: either the "
-                "receipt is from another store, or the layout changed."
-            )
-        profile, confidence = selected
+    lines = group_lines(drop_speckle(load_tsv(tsv)))
+    shop = _profile(profile, [line.text for line in lines])
 
-    extraction = extract(lines, profile)
-    if printed_total is not None:
-        # Someone read the total off the paper because the parser could not, so
-        # it beats anything OCR produced.
-        extraction.printed_total_minor = printed_total
+    extraction = extract(lines, shop)
+    if total is not None:
+        extraction.printed_total_minor = total
         extraction.printed_total_supplied = True
-    validation = validate(extraction, profile)
+        if "printed_total_not_found" in extraction.warnings:
+            extraction.warnings.remove("printed_total_not_found")
+    validation = validate(extraction, shop)
 
-    if prepared is not None and not validation.balanced:
-        from .pipeline import recheck  # noqa: PLC0415 - only needed with an image
+    if image is not None and not validation.balanced:
+        repair = recheck.repair(extraction, validation, image, shop, lines)
+        if repair is not None:
+            recheck.apply(extraction, repair, lines, shop)
+            # Validate again from scratch, so the checks see the new prices.
+            validation = validate(extraction, shop)
 
-        agreed = recheck.repair(extraction, validation, prepared, profile, lines)
-        if agreed is not None:
-            recheck.apply(extraction, agreed, lines)
-            # Re-run the whole check instead of patching the totals, so the
-            # per-line arithmetic and warnings match the new prices.
-            validation = validate(extraction, profile)
-            validation.warnings.append(
-                f"price_column_reread:{len(agreed.changes)}_of_{agreed.disputed}"
-            )
-            if agreed.recovered:
-                validation.warnings.append(f"lines_recovered:{len(agreed.recovered)}")
-
-    rid = receipt_id or uuid.uuid4().hex
-
-    doc = build(
-        receipt_id=rid,
+    document = build(
         lines=lines,
         extraction=extraction,
         validation=validation,
-        profile=profile,
-        profile_confidence=confidence,
-        ocr_meta=ocr_meta or {"engine": "tesseract", "lang": "ita", "psm": 4, "oem": 1},
-        source={"ingested_at": datetime.now(UTC).isoformat()},
-        review=(
-            review
-            if review is not None
-            else document_module.default_review(validation, extraction)
-        ),
+        profile=shop,
+        ocr_meta=ocr or {},
     )
-    return doc, validation.status
+    return Result(document, tsv, image)
 
 
-# Below 26px Tesseract starts losing lines, so a second pass at a larger size is
-# worth the time. A receipt at 25px was fine; one at 20px lost two lines.
+# Below this glyph height Tesseract starts losing lines, so read again enlarged.
 SMALL_GLYPH = 26
 COMFORTABLE_GLYPH = 30
 
-
-def _closer(candidate: dict, current: dict) -> bool:
-    """Whether a second reading is the better of the two.
-
-    Balancing wins. Failing that, the smaller delta wins. With no total to
-    compare against, more lines found wins, since a missed line takes its
-    money with it.
-    """
-    a, b = candidate["totals"], current["totals"]
-    if a["balanced"] != b["balanced"]:
-        return bool(a["balanced"])
-    if a["delta_minor"] is not None and b["delta_minor"] is not None:
-        return abs(a["delta_minor"]) < abs(b["delta_minor"])
-    if (a["printed_total_minor"] is None) != (b["printed_total_minor"] is None):
-        return b["printed_total_minor"] is None
-    return len(a and candidate["line_items"]) > len(current["line_items"])
+# A finer flat field, as a fraction of the photo's width, for creased paper.
+FINE_FLAT_FIELD = 0.025
 
 
-def _read_larger(prepared, tsv: str, **kwargs):
-    """Read the photo again, enlarged, when the first read came out small.
+def _rank(document: dict[str, Any]) -> tuple:
+    """Order readings of one photo: balanced, then clean, then closest, then fullest."""
+    totals = document["totals"]
+    delta = totals["delta_minor"]
+    return (
+        totals["balanced"],
+        document["status"] == "ok",
+        -abs(delta) if delta is not None else float("-inf"),
+        -len(document["review"]),
+        len(document["line_items"]),
+    )
 
-    Only runs on a receipt that did not add up, so a good one never pays for it.
-    Enlarging adds no detail, but Tesseract's line model does better at the size
-    it expects: on one real receipt it found 33 lines instead of 31.
-    """
+
+def _settled(document: dict[str, Any]) -> bool:
+    """Whether the money is all certain, so reading again could not improve it."""
+    return document["totals"]["balanced"] and not any(
+        reason["field"] in {"total", "price", "discount", "items"}
+        for reason in document["review"]
+    )
+
+
+def _readings(path: Path) -> Iterator[tuple[str, Any, dict[str, Any]]]:
+    """Read a photo several ways, cheapest first: (tsv, image, ocr metadata)."""
     from PIL import Image  # noqa: PLC0415 - the parsing core runs without Pillow
 
-    from .pipeline.ocr import run  # noqa: PLC0415
+    from quadra_core.pipeline.ocr import run  # noqa: PLC0415
+    from quadra_core.pipeline.preprocess import preprocess  # noqa: PLC0415
 
+    def read(image, steps):
+        result = run(image, psm=4)
+        meta = {
+            "engine_version": result.engine_version,
+            "psm": result.psm,
+            "preprocessing": steps,
+        }
+        return result.tsv, image, meta
+
+    image, report = preprocess(path)
+    tsv, image, meta = read(image, report.steps)
+    yield tsv, image, meta
+
+    # Small text: read the same image again, enlarged.
     glyph = median_glyph_height(drop_speckle(load_tsv(tsv)))
-    if not glyph or glyph >= SMALL_GLYPH:
-        return None
+    if glyph and glyph < SMALL_GLYPH:
+        scale = COMFORTABLE_GLYPH / glyph
+        bigger = image.resize(
+            (round(image.width * scale), round(image.height * scale)),
+            Image.Resampling.LANCZOS,
+        )
+        yield read(bigger, [*report.steps, f"enlarge x{scale:.2f}"])
 
-    scale = COMFORTABLE_GLYPH / glyph
-    bigger = prepared.resize(
-        (round(prepared.width * scale), round(prepared.height * scale)),
-        Image.Resampling.LANCZOS,
-    )
-    result = run(bigger, psm=4)
-    document, status = parse_tsv(result.tsv, prepared=bigger, **kwargs)
-    return document, status, result.tsv, bigger
+    # Creased paper: even out the lighting over a smaller area.
+    fine, fine_report = preprocess(path, flat_field_scale=FINE_FLAT_FIELD)
+    yield read(fine, fine_report.steps)
 
 
 def parse_image(
-    path: Path,
-    *,
-    profile_id: str | None,
-    review: dict[str, Any] | None = None,
-    printed_total: int | None = None,
-):
-    """Parse a photo, carrying the raw TSV along for archiving.
+    path: str | Path, *, profile: str | None = None, total: int | None = None
+) -> Result:
+    """Read a receipt photo. Never raises on a hard-to-read receipt.
 
-    The document comes back with two private keys, `_tsv` and `_prepared`: the
-    OCR it was built from and the image OCR actually saw. Whoever archives them
-    pops them off first. Item bounding boxes use the prepared image's
-    coordinates, so cropping by box needs that image, not the original photo.
+    If the first reading does not add up, the photo is read again in other ways
+    and the best reading is kept.
     """
-    tsv, ocr_meta = read_input(path)
-    # Removed before parse_tsv: build() copies ocr_meta into the document, and a
-    # PIL image in there makes it unserialisable.
-    prepared = ocr_meta.pop("_prepared", None)
-    shared = {
-        "profile_id": profile_id,
-        "review": review,
-        "ocr_meta": ocr_meta,
-        "printed_total": printed_total,
-    }
-    document, status = parse_tsv(tsv, prepared=prepared, **shared)
-
-    if prepared is not None and not document["totals"]["balanced"]:
-        second = _read_larger(prepared, tsv, **shared)
-        if second is not None and _closer(second[0], document):
-            # The archived image must be the one the TSV describes, or crops on
-            # the review page point at the wrong pixels.
-            document, status, tsv, prepared = second
-
-    # Handed to the archiver, which pops both before the document is written.
-    document["_tsv"] = tsv
-    document["_prepared"] = prepared
-    return document, status
-
-
+    best: Result | None = None
+    for tsv, image, meta in _readings(Path(path)):
+        result = parse_tsv(tsv, profile=profile, total=total, image=image, ocr=meta)
+        if best is None or _rank(result.document) > _rank(best.document):
+            best = result
+        if _settled(best.document):
+            break
+    assert best is not None  # the first reading always yields
+    return best

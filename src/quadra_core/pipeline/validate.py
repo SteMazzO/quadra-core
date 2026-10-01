@@ -1,47 +1,41 @@
-"""Check a receipt against its own arithmetic.
-
-Quantity times unit price should equal the line total, and the lines should sum
-to the printed total. That redundancy is what makes OCR output checkable.
-
-Only numbers are checked here. A misread product name passes everything in this
-module, which is why review sampling exists.
-"""
+"""Check a receipt against its own arithmetic."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
+from typing import NamedTuple
 
 from quadra_core.pipeline.extract import Extraction, LineItem
 from quadra_core.profiles.loader import Profile
 
-# Flags this module owns. parse_tsv validates twice when a repair runs, so these
-# are cleared before each pass; flags set elsewhere (price_reread, line_recovered)
-# are left alone.
-CHECK_FLAGS = frozenset({"line_arithmetic", "quantity_verified"})
+# A name the OCR is less sure of than this goes to review.
+LOW_CONFIDENCE_DESCRIPTION = 0.6
 
-
-@dataclass(frozen=True, slots=True)
-class Check:
-    """A single validation check, either passed or failed."""
-
-    name: str
-    passed: bool
-    detail: str = ""
+# Flags owned by this module, cleared before each run since a repair validates twice.
+CHECK_FLAGS = frozenset(
+    {"quantity_unverified", "price_implausible", "description_unreadable"}
+)
 
 
 @dataclass(slots=True)
 class Validation:
-    """The result of running the arithmetic oracle on a receipt extraction."""
+    """The result of running the arithmetic checks on a receipt extraction."""
 
-    status: str  # "ok" | "partial" | "failed"
-    checks: list[Check] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # The items alone, then the items plus the discounts, which is what the
+    # reference total should equal.
     items_subtotal_minor: int = 0
+    computed_total_minor: int = 0
+    # The figure the items are checked against, and where it came from.
     printed_total_minor: int | None = None
+    total_source: str = "none"  # "printed" | "payments" | "supplied" | "none"
     delta_minor: int | None = None
-    # Which independent figure the item sum was checked against.
-    total_source: str = "none"  # "printed" | "payments" | "none"
+    # Two independent readings agree on the total: the printed total and the
+    # payments, or a person typed it in.
+    total_confirmed: bool = False
+    # The printed total and the payments disagree, and the items side with neither.
+    total_disputed: bool = False
 
     @property
     def balanced(self) -> bool:
@@ -49,159 +43,115 @@ class Validation:
         return self.delta_minor == 0
 
 
-def check_line_arithmetic(item: LineItem) -> Check:
-    """Quantity x unit_price == line_total, within one minor unit of rounding."""
-    if (
-        item.unit_price_minor is None
-        or item.line_total_minor is None
-        or item.quantity is None
-    ):
-        return Check("line_arithmetic", False, "incomplete line")
+def quantity_problem(item: LineItem, profile: Profile) -> str | None:
+    """Say why an item's quantity can't be trusted, or None if it can."""
+    q = item.quantity
+    if q is None or item.unit_price_minor is None or item.line_total_minor is None:
+        return "incomplete line"
+    if q <= 0 or q > profile.max_quantity:
+        return f"out of range: {q}"
 
-    expected = (item.quantity * Decimal(item.unit_price_minor)).quantize(
+    expected = (q * Decimal(item.unit_price_minor)).quantize(
         Decimal(1), rounding=ROUND_HALF_UP
     )
-    delta = abs(int(expected) - item.line_total_minor)
-    # One minor unit of slack, since stores round weighed goods differently and
-    # the convention is not something to assume.
-    return Check("line_arithmetic", delta <= 1, f"delta={delta}")
+    if abs(int(expected) - item.line_total_minor) > 1:
+        return f"{q} x {item.unit_price_minor} != {item.line_total_minor}"
+
+    # Real and misread fractions look alike unless the fraction was printed.
+    if q != q.to_integral_value() and item.quantity_source not in {
+        "parsed",
+        "modifier",
+    }:
+        return f"uncorroborated fraction: {q}"
+    return None
 
 
-def check_quantity_verified(item: LineItem, profile: Profile) -> Check:
-    """Report whether the quantity was corroborated, not whether it looks right.
-
-    Arithmetic cannot separate these two, both from the same photo and both
-    non-integer:
-
-        MELE GOLDEN KG   q=1.241  unit=2,49   correct, sold by weight
-        YOGURT MAGRO     q=0.111  unit=31,15  wrong, '1,15' read as '31,15'
-
-    Anything claiming to tell them apart would be guessing, so send both for review.
-    """
-    q = item.quantity
-    if q is None:
-        return Check("quantity_verified", False, "missing")
-    if q <= 0 or q > profile.max_quantity:
-        return Check("quantity_verified", False, f"out of range: {q}")
-    if q == q.to_integral_value():
-        return Check("quantity_verified", True)
-    if item.quantity_source in {"parsed", "modifier"}:
-        return Check("quantity_verified", True, "fractional but read directly")
-    return Check("quantity_verified", False, f"uncorroborated fraction: {q}")
+class _Reference(NamedTuple):
+    source: str
+    total: int | None
+    confirmed: bool = False
+    disputed: bool = False
+    warning: str | None = None
 
 
-def validate(extraction: Extraction, profile: Profile) -> Validation:
-    """Run the checks and work out an overall status."""
-    result = Validation(status="ok", warnings=list(extraction.warnings))
+def _reference_total(extraction: Extraction, computed: int) -> _Reference:  # noqa: PLR0911 - a decision table
+    """Pick the figure to check the items against, and say how sure it is."""
+    printed = extraction.printed_total_minor
+    if extraction.printed_total_supplied:
+        return _Reference("supplied", printed, confirmed=True)
 
-    if not profile.calibrated:
-        result.warnings.append("profile_not_calibrated")
-
-    subtotal = sum(a.amount_minor for a in extraction.adjustments)
-    for item in extraction.items:
-        item.flags[:] = [f for f in item.flags if f not in CHECK_FLAGS]
-        if item.line_total_minor is not None:
-            subtotal += item.line_total_minor
-
-        for check in (
-            check_line_arithmetic(item),
-            check_quantity_verified(item, profile),
-        ):
-            if not check.passed:
-                item.flags.append(check.name)
-                result.warnings.append(
-                    f"item[{item.line_index}]:{check.name}:{check.detail}"
-                )
-
-    result.items_subtotal_minor = subtotal
-
-    # Amounts tendered less any change restates the total independently of the
-    # item lines, so it is a real cross-check. It also rescues receipts whose
-    # printed total is in a font Tesseract cannot read: on one photo
-    # 'TOTALE EURO 26,44' came back as 'db, +' at every scale and threshold,
-    # while 0,04 + 9,50 + 16,90 read cleanly.
-    payments_total = (
+    payments = (
         sum(extraction.payments_minor) - extraction.change_minor
         if extraction.payments_minor
         else None
     )
-    printed = extraction.printed_total_minor
 
-    # The items and the payment line are read independently of each other. When
-    # they agree and the printed total does not, the printed total is the one that
-    # was misread: 33 item prices do not conspire to match a payment line by
-    # accident. Seen on a real photo where 'TOTALE EURO 101,29' came back as
-    # '101,2' + '4' and joined to 101,24, against items and payments both at 101,29.
-    corroborated = (
-        not extraction.printed_total_supplied
-        and printed is not None
-        and payments_total is not None
-        and payments_total != printed
-        and subtotal == payments_total
+    if printed is not None and payments is not None:
+        if printed == payments:
+            return _Reference("printed", printed, confirmed=True)
+        # Two readings disagree; the items, a third, can say which one was misread.
+        if computed == payments:
+            return _Reference(
+                "payments", payments, True, warning=f"printed_total_misread:{printed}"
+            )
+        if computed == printed:
+            return _Reference(
+                "printed", printed, True, warning=f"payment_misread:{payments}"
+            )
+        return _Reference(
+            "printed",
+            printed,
+            disputed=True,
+            warning=f"payments_disagree:{payments}!={printed}",
+        )
+
+    if printed is not None:
+        return _Reference("printed", printed)
+    if payments is not None:
+        # Payments survive when the printed total is too large or bold to read.
+        return _Reference(
+            "payments", payments, warning="printed_total_unreadable_used_payments"
+        )
+    return _Reference("none", None)
+
+
+def validate(extraction: Extraction, profile: Profile) -> Validation:
+    """Run the checks, flagging each item that needs a second look."""
+    result = Validation(warnings=list(extraction.warnings))
+
+    if not profile.calibrated:
+        result.warnings.append("profile_not_calibrated")
+
+    result.items_subtotal_minor = sum(
+        i.line_total_minor for i in extraction.items if i.line_total_minor is not None
+    )
+    result.computed_total_minor = result.items_subtotal_minor + sum(
+        a.amount_minor for a in extraction.adjustments
     )
 
-    if corroborated:
-        result.total_source = "payments"
-        result.printed_total_minor = payments_total
-        result.delta_minor = 0
-        result.warnings.append(f"printed_total_misread:{printed}!={payments_total}")
-        result.checks.append(
-            Check("receipt_total", True, f"delta=0 (printed {printed} misread)")
-        )
-    elif printed is not None:
-        result.total_source = "printed"
-        result.printed_total_minor = printed
-        result.delta_minor = subtotal - printed
-        result.checks.append(
-            Check(
-                "receipt_total", result.delta_minor == 0, f"delta={result.delta_minor}"
-            )
-        )
-        # If both are readable they have to agree, otherwise one was misread.
-        if payments_total is not None and payments_total != printed:
-            result.warnings.append(
-                f"payments_disagree_with_printed_total:{payments_total}!={printed}"
-            )
-    elif payments_total is not None:
-        result.total_source = "payments"
-        result.printed_total_minor = payments_total
-        result.delta_minor = subtotal - payments_total
-        result.warnings.append("printed_total_unreadable_used_payments")
-        result.checks.append(
-            Check(
-                "receipt_total",
-                result.delta_minor == 0,
-                f"delta={result.delta_minor} (vs payments)",
-            )
-        )
-    else:
-        result.checks.append(
-            Check("receipt_total", False, "no total or payments found")
-        )
+    reference = _reference_total(extraction, result.computed_total_minor)
+    total = reference.total
+    result.total_source = reference.source
+    result.printed_total_minor = total
+    result.total_confirmed = reference.confirmed
+    result.total_disputed = reference.disputed
+    if reference.warning:
+        result.warnings.append(reference.warning)
+    if total is not None:
+        result.delta_minor = result.computed_total_minor - total
 
-    # A line that looked like a product but had no readable price takes its
-    # money out of the total. Warn about it, or the receipt is wrong with
-    # nothing to point at.
+    for item in extraction.items:
+        item.flags[:] = [f for f in item.flags if f not in CHECK_FLAGS]
+        problem = quantity_problem(item, profile)
+        if problem:
+            item.flags.append("quantity_unverified")
+            result.warnings.append(f"item[{item.line_index}]:quantity:{problem}")
+        # No single line can cost more than the whole receipt.
+        if total and (item.line_total_minor or 0) > total:
+            item.flags.append("price_implausible")
+        if item.confidence < LOW_CONFIDENCE_DESCRIPTION:
+            item.flags.append("description_unreadable")
+
     for line_index in extraction.skipped_lines:
         result.warnings.append(f"line_without_a_price:{line_index}")
-
-    per_item_ok = sum(1 for i in extraction.items if not i.flags)
-    result.checks.append(
-        Check(
-            "items_extracted", bool(extraction.items), f"{len(extraction.items)} items"
-        )
-    )
-    result.checks.append(
-        Check(
-            "items_clean",
-            per_item_ok == len(extraction.items),
-            f"{per_item_ok}/{len(extraction.items)} without flags",
-        )
-    )
-
-    # Status. A receipt is always returned, graded rather than discarded.
-    if not extraction.items:
-        result.status = "failed"
-    elif any(not c.passed for c in result.checks) or result.warnings:
-        result.status = "partial"
     return result

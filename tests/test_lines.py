@@ -1,8 +1,4 @@
-"""Line and column reconstruction tests.
-
-Fixtures are real Tesseract 5.3.4 output for a synthetic receipt, captured clean
-and badly degraded, so these tests run without Tesseract or Pillow installed.
-"""
+"""Line and column reconstruction tests, over OCR of a synthetic receipt."""
 
 from __future__ import annotations
 
@@ -44,12 +40,7 @@ def test_tsv_parses_and_drops_structural_rows(variant):
 
 
 def test_speckle_filter_uses_height_not_confidence():
-    """Regression guard for a measured trap.
-
-    On the degraded fixture the noise artefact '-' scores 90.7 confidence while the
-    genuine token '4X125.' scores 0.0. Anything that filters on confidence would keep
-    the garbage and delete the data, so assert the filter is geometric.
-    """
+    """Speckle is filtered by height, since its OCR confidence can be high."""
     words = load("synthetic_faded")
     kept = drop_speckle(words)
     dropped = [w for w in words if w not in kept]
@@ -73,7 +64,7 @@ def test_line_count_is_stable_across_image_quality():
 
 
 def test_every_item_price_shares_a_line_with_its_description(variant):
-    """The core requirement: a price must not be separated from its description."""
+    """A price is never separated from its description."""
     lines = group_lines(drop_speckle(load(variant)))
     for price in ITEM_PRICES:
         hosts = [l for l in lines if price in l.text]
@@ -83,7 +74,7 @@ def test_every_item_price_shares_a_line_with_its_description(variant):
 
 
 def test_price_column_is_right_anchored_and_tight(variant):
-    """Right edges cluster even when the description-to-price gap fills with garbage."""
+    """Price right edges cluster tightly at the right of the block."""
     lines = group_lines(drop_speckle(load(variant)))
     column = discover_price_column(lines, PRICE)
     assert column is not None

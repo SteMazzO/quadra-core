@@ -1,12 +1,6 @@
-"""Show what the parser sees on a receipt, so a profile can be written from it.
+"""Show what the parser sees on a receipt, to help write a profile.
 
-Prints the preprocessing steps, the reconstructed lines with their confidence, the
-price column it found, and under a given profile which rule claimed each line and what
-came out. Writing a profile without this is guesswork.
-
-A new shop needs a stub profile before there is anything to report against;
-with no --profile the receipt is fingerprinted against the shops already
-shipped, which a new one will not match. See 'Adding a shop' in README.md.
+A new shop needs a stub profile first; see 'Adding a shop' in README.md.
 
 Usage:
     python3 tools/calibrate.py receipt.jpg                     # detect the shop
@@ -33,6 +27,7 @@ from quadra_core.pipeline.lines import (
 )
 from quadra_core.pipeline.money import format_minor
 from quadra_core.pipeline.ocr import run_on_path
+from quadra_core.pipeline.review import reasons, status
 from quadra_core.pipeline.validate import validate
 from quadra_core.profiles import loader
 from quadra_core.testdata import OCR as FIXTURE_DIR
@@ -127,18 +122,20 @@ def report_extraction(extraction) -> None:
         )
 
 
-def report_validation(result) -> None:
-    """Print the arithmetic verdict."""
-    print(f"{RULE}\nVALIDATION  status={result.status}")
+def report_validation(result, found, verdict) -> None:
+    """Print the arithmetic verdict, and what a person would be asked to check."""
+    print(f"{RULE}\nVALIDATION  status={verdict}")
     print(f"  items subtotal   {format_minor(result.items_subtotal_minor):>10}")
+    print(f"  computed total   {format_minor(result.computed_total_minor):>10}")
     printed = result.printed_total_minor
     shown = format_minor(printed) if printed is not None else "NOT FOUND"
-    print(f"  printed total    {shown:>10}")
+    print(f"  total ({result.total_source:<8}) {shown:>10}")
     if result.delta_minor is not None:
         verdict = "BALANCED" if result.balanced else "*** MISMATCH ***"
         print(f"  delta            {format_minor(result.delta_minor):>10}   {verdict}")
-    for check in result.checks:
-        print(f"  [{'ok  ' if check.passed else 'FAIL'}] {check.name}: {check.detail}")
+    for reason in found:
+        where = f" item {reason.item}" if reason.item is not None else ""
+        print(f"  review{where}: {reason.message}")
     for warning in result.warnings:
         print(f"  warn: {warning}")
 
@@ -169,8 +166,6 @@ def main() -> int:
     if args.save_fixture:
         save_fixture(tsv, args.save_fixture)
 
-    # No profile means no report, whether a named one was missing or the fingerprint
-    # matched nothing. Either way this run produced nothing to act on.
     profile = report_geometry(tsv, lines, args.profile)
     if profile is None:
         return 2
@@ -178,10 +173,12 @@ def main() -> int:
     report_lines(lines, profile)
     extraction = extract(lines, profile)
     result = validate(extraction, profile)
+    found = reasons(extraction, result, profile, lines)
+    verdict = status(extraction, found)
     report_extraction(extraction)
-    report_validation(result)
+    report_validation(result, found, verdict)
 
-    return 0 if result.status == "ok" else 1
+    return 0 if verdict == "ok" else 1
 
 
 if __name__ == "__main__":

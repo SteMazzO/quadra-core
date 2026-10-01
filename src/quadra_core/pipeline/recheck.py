@@ -1,43 +1,111 @@
-"""Re-read the price column when a receipt does not balance."""
+"""Re-read the price column when a receipt does not balance.
+
+The arithmetic proposes; it never has the last word. A correction is taken as
+certain only when the total was confirmed by two readings and every re-read of
+the column agrees on the new price. Anything less is kept as a suggestion and the
+line goes to review.
+"""
 
 from __future__ import annotations
 
-import itertools
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
-from quadra_core.pipeline.extract import Extraction, LineItem, parse_amount
-from quadra_core.pipeline.lines import Line, drop_speckle, group_lines, load_tsv
+from quadra_core.pipeline.extract import (
+    Adjustment,
+    Extraction,
+    LineItem,
+    description_confidence,
+    name_words,
+    parse_amount,
+    read_vat_code,
+    strip_noise,
+)
+from quadra_core.pipeline.lines import (
+    Block,
+    Line,
+    Word,
+    cluster_1d,
+    drop_speckle,
+    group_lines,
+    load_tsv,
+    median_glyph_height,
+    text_block,
+)
 
-if TYPE_CHECKING:  # pragma: no cover - import cost on a device that may not need it
+if TYPE_CHECKING:  # pragma: no cover
     from ..profiles.loader import Profile
     from .validate import Validation
 
-# Enlarging the strip is cheap, since the column is a fraction of the page, and
-# gives Tesseract the glyph size it prefers.
-SCALE = 3
+# (scale, psm) per reading. Each misreads different prices, so they vote.
+READINGS = ((3, 6), (2, 4), (1, 11))
 
-# Slack around the column so no digit is clipped and the strip is not so tight
-# that Tesseract loses the line.
+# Margin around the column, so no digit is clipped.
 PAD = 16
 
-# 12 disagreements is 4096 combinations, which is fast enough. Past that the
-# receipt is too badly read for the arithmetic to pick a single answer, and more
-# combinations just means more of them balancing by coincidence.
-MAX_DISPUTED = 12
+# Past this many disputed lines, too many combinations balance by coincidence.
+MAX_DISPUTED = 16
+
+# Lines on which the total may overrule a clear majority of readings. More than
+# one lets a wrong answer balance by coincidence.
+MAX_OVERRULED = 1
+
+# A word taller than this many glyph heights is two rows read as one.
+_MERGED_ROW_RATIO = 1.5
+
+# A product name has at least two letters in a row.
+_NAMED = re.compile(r"[^\W\d_]{2,}")
+
+# How many re-reads must agree, and none disagree, for a correction to be certain.
+CERTAIN_READINGS = 2
+
+# Misreads seen in the price column on its own, where every row is a price.
+# '1,20=S' for '1,20-S'; the dashes are en and em.
+_SIGN_LIKE = re.compile("[-=~\u2013\u2014]" + r"\s*\S?\s*$")
+_LOST_LEADING_ONE = re.compile(r"^[^\d,.]?(?=[,.]\d{2}$)")  # '»,98' for '1,98'
+_ODD_SEPARATOR = re.compile(r"(?<=\d)\D(?=\d{2}$)")  # '1}20' for '1,20'
+_NO_SEPARATOR = re.compile(r"\d{3}")  # '449' for '4,49'
+
+
+def read_cell(text: str, profile: Profile) -> int | None:
+    """Read one row of the price column, allowing for how thermal print misreads.
+
+    Only used for the column re-read: every row there is a price, and the total
+    decides between readings, so a wrong guess here is outvoted, not trusted.
+    """
+    amount = parse_amount(text, profile)
+    if amount is not None or profile.decimal_places != 2:
+        return amount
+
+    negative = bool(_SIGN_LIKE.search(text))
+    core = _SIGN_LIKE.sub("", text).strip()
+    core = _LOST_LEADING_ONE.sub("1", core, count=1)
+    core = _ODD_SEPARATOR.sub(profile.decimal_separator, core, count=1)
+    core = core.lstrip(".,;:'\u2018\u2019")
+    if _NO_SEPARATOR.fullmatch(core):
+        core = f"{core[0]}{profile.decimal_separator}{core[1:]}"
+    amount = parse_amount(core, profile)
+    if amount is None:
+        return None
+    return -abs(amount) if negative else amount
 
 
 @dataclass(slots=True)
 class Repair:
     """What the second reading changed, and what it left alone."""
 
-    # Keyed by line index, not by position in extraction.items: apply() inserts
-    # recovered lines and re-sorts, which would invalidate a positional key.
+    # Keyed by line index, since apply() re-sorts the items.
     changes: dict[int, tuple[int, int]] = field(default_factory=dict)
-    # Line index -> price, for lines the first pass dropped and the sums need.
+    # Line index -> amount for lines the first pass dropped; negative for a discount.
     recovered: dict[int, int] = field(default_factory=dict)
+    # Line indexes whose new amount is certain; every other change needs review.
+    certain: set[int] = field(default_factory=set)
     disputed: int = 0
+    # Where a recovered line's description ends, in page pixels.
+    column_left: int | None = None
 
     @property
     def applied(self) -> bool:
@@ -45,68 +113,202 @@ class Repair:
         return bool(self.changes) or bool(self.recovered)
 
 
-def _price_words(lines: list[Line], extraction: Extraction) -> dict[int, Any]:
-    """Rightmost word per line of interest: the price, as the first pass read it.
+class Column(NamedTuple):
+    """Where the prices sit on the page, measured once per receipt."""
 
-    Both the lines that produced an item and the ones that were dropped for having
-    no readable price. A dropped line is the worse of the two: a misread price is at
-    least visible in the total, while a line that never became an item takes its
-    money away in silence.
-    """
+    # Line index -> the rightmost word of normal height, i.e. where its price is.
+    prices: dict[int, Word]
+    # Left edge of the price column in page pixels, or None if no line had a price.
+    left: int | None
+    glyph: float
+
+
+def survey(lines: list[Line], extraction: Extraction) -> Column:
+    """Locate the price of every item and dropped line, and the column they form."""
     by_index = {line.index: line for line in lines}
-    wanted = [item.line_index for item in extraction.items]
-    wanted += extraction.skipped_lines
-    out = {}
-    for index in wanted:
+    glyph = median_glyph_height([w for line in lines for w in line.words])
+
+    prices: dict[int, Word] = {}
+    for index in [i.line_index for i in extraction.items] + extraction.skipped_lines:
         line = by_index.get(index)
-        if line and line.words:
-            out[index] = max(line.words, key=lambda w: w.right)
-    return out
+        if not line or not line.words:
+            continue
+        # Words spanning two rows are skipped: a dropped line is usually dropped
+        # because its price came back as one of those.
+        sane = [w for w in line.words if w.height <= glyph * _MERGED_ROW_RATIO]
+        prices[index] = max(sane or line.words, key=lambda w: w.right)
+
+    # The left edge comes from the largest cluster, so one line offering only a
+    # description word cannot widen the column to the whole page.
+    lefts = [
+        float(prices[i.line_index].left)
+        for i in extraction.items
+        if i.line_index in prices
+    ]
+    left = None
+    if lefts:
+        clusters = cluster_1d(lefts, gap=glyph or 1.0)
+        left = int(min(max(clusters, key=lambda c: (len(c), c[0]))))
+    return Column(prices, left, glyph)
+
+
+def _column_rows(
+    prepared: Any, left: int, right: int, scale: int, psm: int
+) -> list[tuple[float, str]]:
+    """One reading of the strip: (centre in page pixels, text) per row."""
+    from PIL import Image  # noqa: PLC0415 - the parsing core runs without Pillow
+
+    from .ocr import run  # noqa: PLC0415 - keeps Tesseract off the import path
+
+    strip = prepared.crop((left, 0, right, prepared.height))
+    if scale != 1:
+        strip = strip.resize(
+            (strip.width * scale, strip.height * scale), Image.Resampling.LANCZOS
+        )
+    rows = group_lines(drop_speckle(load_tsv(run(strip, psm=psm).tsv)))
+    return [
+        (
+            sum(w.cy for w in row.words) / len(row.words) / scale,
+            "".join(w.text for w in row.words),
+        )
+        for row in rows
+    ]
+
+
+def _assign(
+    rows: list[tuple[float, str]], positions: dict[int, float], tolerance: float
+) -> dict[int, str]:
+    """Pair each strip row with its nearest line, keeping one row per line."""
+    best: dict[int, tuple[float, str]] = {}
+    for centre, text in rows:
+        index, y = min(positions.items(), key=lambda p: abs(p[1] - centre))
+        distance = abs(y - centre)
+        if distance <= tolerance and (index not in best or distance < best[index][0]):
+            best[index] = (distance, text)
+    return {index: text for index, (_distance, text) in best.items()}
 
 
 def second_opinion(
-    prepared: Any, lines: list[Line], extraction: Extraction, profile: Profile
-) -> dict[int, int]:
-    """Read the price column on its own. Returns line index -> amount.
-
-    One crop and one pass, not one per price. Reading each price in its own little
-    box was tried and is worse as well as slower: cut that tight, Tesseract loses
-    the run of text it uses to size glyphs, and it started misreading prices the
-    full page had read correctly.
-    """
-    from .ocr import run  # noqa: PLC0415 - keeps Tesseract off the import path
-
-    words = _price_words(lines, extraction)
-    if not words:
+    prepared: Any, column: Column, profile: Profile
+) -> dict[int, list[int]]:
+    """Read the price column on its own, several ways: line index -> amounts."""
+    if not column.prices:
         return {}
 
-    left = max(0, min(w.left for w in words.values()) - PAD)
-    right = min(prepared.width, max(w.right for w in words.values()) + PAD)
+    left = max(0, (column.left or min(w.left for w in column.prices.values())) - PAD)
+    right = min(prepared.width, max(w.right for w in column.prices.values()) + PAD)
     if right - left < 1:
         return {}
 
-    strip = prepared.crop((left, 0, right, prepared.height))
-    strip = strip.resize((strip.width * SCALE, strip.height * SCALE))
-    # psm 6 - a uniform block. The strip is one column of numbers and nothing else.
-    strip_lines = group_lines(drop_speckle(load_tsv(run(strip, psm=6).tsv)))
-    if not strip_lines:
-        return {}
-
-    centres = [
-        (sum(w.cy for w in line.words) / len(line.words), line) for line in strip_lines
-    ]
-
-    out: dict[int, int] = {}
-    for line_index, word in words.items():
-        wanted = word.cy * SCALE
-        centre, line = min(centres, key=lambda c: abs(c[0] - wanted))
-        # Only trust a row that lines up with the one being asked about.
-        if abs(centre - wanted) > word.height * SCALE:
-            continue
-        amount = parse_amount("".join(w.text for w in line.words), profile)
-        if amount is not None:
-            out[line_index] = amount
+    positions = {index: word.cy for index, word in column.prices.items()}
+    out: dict[int, list[int]] = {}
+    for scale, psm in READINGS:
+        rows = _column_rows(prepared, left, right, scale, psm)
+        for index, text in _assign(rows, positions, column.glyph).items():
+            amount = read_cell(text, profile)
+            if amount is not None:
+                out.setdefault(index, []).append(amount)
     return out
+
+
+def _item_votes(item: LineItem, readings: list[int]) -> Counter[int]:
+    """Return what this item's price might be: the first pass, plus each reading."""
+    votes = Counter(readings)
+    votes[item.line_total_minor or 0] += 1
+    if not _NAMED.search(item.description):
+        # Maybe a neighbour's price on a row of its own, so allow dropping it.
+        votes.setdefault(0, 0)
+    return votes
+
+
+def _dropped_votes(
+    line: Line | None, readings: list[int], profile: Profile
+) -> Counter[int]:
+    """Return what a dropped line might hold: nothing, or what the column read."""
+    # A discount by its label, or by a minus sign in any reading.
+    discount = any(amount < 0 for amount in readings) or (
+        line is not None and profile.rule_for(line.text) == "discount"
+    )
+    votes = Counter(
+        -abs(amount) if discount else amount
+        for amount in readings
+        if discount or amount > 0
+    )
+    if votes:
+        votes.setdefault(0, 0)
+    return votes
+
+
+def _leader(votes: Counter[int]) -> int | None:
+    """Return the amount with the most votes, or None when the top is shared."""
+    top = max(votes.values())
+    leaders = [amount for amount, count in votes.items() if count == top]
+    return leaders[0] if len(leaders) == 1 else None
+
+
+class _Cell(NamedTuple):
+    """One running sum in _choose's table."""
+
+    rank: tuple[int, int]  # (-lines overruled, votes), so higher is better
+    ways: int  # how many ways reach that rank, counted up to 2
+    previous: int  # the running sum this came from
+    amount: int  # the amount taken to get here
+
+
+def _choose(slots: list[Counter[int]], target: int) -> list[int] | None:
+    """Pick one amount per slot summing to target, or None if none or tied.
+
+    Prefers the fewest overruled majorities, then the most votes.
+    """
+    tables: list[dict[int, _Cell]] = []
+    current = {0: _Cell((0, 0), 1, 0, 0)}
+    for votes in slots:
+        leader = _leader(votes)
+        following: dict[int, _Cell] = {}
+        for running, cell in current.items():
+            for amount, count in votes.items():
+                overruled = int(leader is not None and amount != leader)
+                rank = (cell.rank[0] - overruled, cell.rank[1] + count)
+                if -rank[0] > MAX_OVERRULED:
+                    continue
+                key = running + amount
+                held = following.get(key)
+                if held is None or rank > held.rank:
+                    following[key] = _Cell(rank, cell.ways, running, amount)
+                elif rank == held.rank:
+                    following[key] = held._replace(ways=min(2, held.ways + cell.ways))
+        tables.append(following)
+        current = following
+
+    end = current.get(target)
+    if end is None or end.ways > 1:
+        return None
+    chosen = []
+    running = target
+    for table in reversed(tables):
+        cell = table[running]
+        chosen.append(cell.amount)
+        running = cell.previous
+    return chosen[::-1]
+
+
+def _slots(
+    extraction: Extraction,
+    readings: dict[int, list[int]],
+    lines: list[Line],
+    profile: Profile,
+) -> list[tuple[int, Counter[int]]]:
+    """One slot of candidate amounts per item, and per line that lost its price."""
+    by_index = {line.index: line for line in lines}
+    slots = [
+        (item.line_index, _item_votes(item, readings.get(item.line_index, [])))
+        for item in extraction.items
+    ]
+    for index in extraction.skipped_lines:
+        votes = _dropped_votes(by_index.get(index), readings.get(index, []), profile)
+        if votes:
+            slots.append((index, votes))
+    return slots
 
 
 def repair(
@@ -116,79 +318,101 @@ def repair(
     profile: Profile,
     lines: list[Line],
 ) -> Repair | None:
-    """Reconcile the two readings against the printed total.
-
-    Returns None when there is nothing to do or nothing certain to say. The bar is
-    exactly one combination that balances: two would mean the receipt cannot tell
-    them apart, and picking either would be a guess wearing a proof's clothes.
-    """
+    """Reconcile the readings with the printed total, or None if unsure."""
     target = validation.printed_total_minor
     if target is None or validation.delta_minor == 0 or not extraction.items:
         return None
-
-    other = second_opinion(prepared, lines, extraction, profile)
-    if not other:
+    # The printed total and the payments disagree: aiming at either could bend
+    # correct prices to a misread total.
+    if validation.total_disputed:
         return None
 
-    # A slot per item, plus one per dropped line. A dropped line is offered
-    # either as nothing or as the price the column read.
-    options: list[list[int]] = []
-    for item in extraction.items:
-        first = item.line_total_minor
-        candidates = [first]
-        second = other.get(item.line_index)
-        if second is not None and second != first:
-            candidates.append(second)
-        options.append(candidates)
+    column = survey(lines, extraction)
+    readings = second_opinion(prepared, column, profile)
+    if not readings:
+        return None
 
-    recoverable: list[int] = []
-    for line_index in extraction.skipped_lines:
-        found = other.get(line_index)
-        if found is not None and found > 0:
-            recoverable.append(line_index)
-            options.append([0, found])
-
-    disputed = [i for i, c in enumerate(options) if len(c) > 1]
+    slots = _slots(extraction, readings, lines, profile)
+    disputed = [(index, votes) for index, votes in slots if len(votes) > 1]
     if not disputed or len(disputed) > MAX_DISPUTED:
         return None
 
+    settled = sum(next(iter(votes)) for _index, votes in slots if len(votes) == 1)
     adjustments = sum(a.amount_minor for a in extraction.adjustments)
-    undisputed = set(range(len(options))) - set(disputed)
-    settled = sum(
-        options[i][0] for i in undisputed if options[i][0] is not None
+    chosen = _choose(
+        [votes for _index, votes in disputed], target - settled - adjustments
     )
-
-    balancing = [
-        combination
-        for combination in itertools.product(*[options[i] for i in disputed])
-        if settled + adjustments + sum(combination) == target
-    ]
-    if len(balancing) != 1:
+    if chosen is None:
         return None
 
-    chosen = dict(zip(disputed, balancing[0], strict=True))
-    result = Repair(disputed=len(disputed))
-    first_recovered = len(extraction.items)
-    for index, value in chosen.items():
-        if index >= first_recovered:
-            # A dropped line the sums need. Zero means leave it dropped.
-            if value:
-                result.recovered[recoverable[index - first_recovered]] = value
-            continue
-        item = extraction.items[index]
-        if value != item.line_total_minor:
-            result.changes[item.line_index] = (item.line_total_minor, value)
+    result = Repair(disputed=len(disputed), column_left=column.left)
+    _record(result, extraction, disputed, chosen, validation.total_confirmed)
     return result if result.applied else None
 
 
-def _recovered_item(line: Line, price: int) -> LineItem:
-    """Build the item for a line the first pass dropped.
+def _record(
+    result: Repair,
+    extraction: Extraction,
+    disputed: list[tuple[int, Counter[int]]],
+    chosen: list[int],
+    total_confirmed: bool,
+) -> None:
+    """Write what the choice changed into the repair, and which of it is certain."""
+    first = {item.line_index: item.line_total_minor for item in extraction.items}
+    for (index, votes), amount in zip(disputed, chosen, strict=True):
+        if index not in first:
+            # A dropped line; zero means leave it dropped.
+            if not amount:
+                continue
+            result.recovered[index] = amount
+        elif amount != first[index]:
+            result.changes[index] = (first[index], amount)
+        else:
+            continue
+        if total_confirmed and _unanimous(votes, amount, index in first):
+            result.certain.add(index)
 
-    The description keeps the whole line, price and all. Trimming it would mean
-    guessing where the price started, and the price is exactly the part the first
-    pass could not find. It is flagged, so somebody reads it either way.
-    """
-    text = " ".join(w.text for w in line.words).strip()
+
+def _unanimous(votes: Counter[int], amount: int, has_first_reading: bool) -> bool:
+    """Whether every re-read of the column says `amount`, and enough of them do."""
+    # Dropping a line is never read off the column, so it is never certain.
+    if amount == 0:
+        return False
+    rereads = sum(votes.values()) - (1 if has_first_reading else 0)
+    return votes[amount] >= CERTAIN_READINGS and votes[amount] == rereads
+
+
+def _describing_words(
+    line: Line,
+    column_left: int | None,
+    profile: Profile,
+    block: Block,
+    vat_column: float | None,
+) -> tuple[list[Word], str | None]:
+    """Return a recovered line's name, left of the price column, and its VAT code."""
+    words = [
+        w for w in line.words if column_left is None or w.cx < column_left
+    ] or line.words
+    if vat_column is not None:
+        named = name_words(words, block, vat_column) or strip_noise(words)
+        for word in words:
+            if word not in named:
+                vat_code = read_vat_code(word.text, profile)
+                if vat_code is not None:
+                    return named, vat_code
+        return named, None
+    if len(words) > 1:
+        vat_code = read_vat_code(words[-1].text, profile)
+        if vat_code is not None:
+            return strip_noise(words[:-1]), vat_code
+    return strip_noise(words), None
+
+
+def _recovered_item(
+    line: Line, words: list[Word], price: int, vat_code: str | None
+) -> LineItem:
+    """Build the item for a line the first pass dropped."""
+    text = " ".join(w.text for w in words).strip()
     return LineItem(
         description_raw=text,
         description=" ".join(text.split()),
@@ -196,39 +420,80 @@ def _recovered_item(line: Line, price: int) -> LineItem:
         quantity_source="implicit",
         unit_price_minor=price,
         line_total_minor=price,
-        vat_code=None,
-        confidence=round(min(w.conf for w in line.words) / 100, 3),
+        vat_code=vat_code,
+        confidence=description_confidence(words),
         line_index=line.index,
         bbox=(line.left, line.top, line.right - line.left, line.bottom - line.top),
         flags=["line_recovered"],
     )
 
 
-def apply(extraction: Extraction, result: Repair, lines: list[Line]) -> None:
-    """Write the agreed prices back, and say so on everything that moved."""
+def _recover(
+    extraction: Extraction, result: Repair, lines: list[Line], profile: Profile
+) -> None:
+    """Add back the lines the first pass dropped, as items or as discounts."""
     by_index = {line.index: line for line in lines}
-    for line_index, price in sorted(result.recovered.items()):
+    block = text_block(lines)
+    for line_index, amount in sorted(result.recovered.items()):
         line = by_index.get(line_index)
         if line is None:
             continue
-        extraction.items.append(_recovered_item(line, price))
+        words, vat_code = _describing_words(
+            line, result.column_left, profile, block, extraction.vat_column
+        )
+        if amount < 0:
+            label = " ".join(" ".join(w.text for w in words).split())
+            extraction.adjustments.append(
+                Adjustment(
+                    "discount",
+                    label,
+                    amount,
+                    line_index,
+                    unconfirmed=line_index not in result.certain,
+                )
+            )
+        else:
+            extraction.items.append(_recovered_item(line, words, amount, vat_code))
+
+    extraction.items.sort(key=lambda i: i.line_index)
+    extraction.adjustments.sort(key=lambda a: a.line_index)
+    extraction.skipped_lines = [
+        i for i in extraction.skipped_lines if i not in result.recovered
+    ]
+
+
+def apply(
+    extraction: Extraction, result: Repair, lines: list[Line], profile: Profile
+) -> None:
+    """Write the agreed prices back, and flag everything that moved.
+
+    A change that is not certain carries `price_unconfirmed`, which sends the line
+    to review with the arithmetic's answer as a suggestion.
+    """
     if result.recovered:
-        # Items are read down the page, so a recovered one has to go back in
-        # position or the review page shows it out of order.
-        extraction.items.sort(key=lambda i: i.line_index)
+        _recover(extraction, result, lines, profile)
+        for item in extraction.items:
+            if item.line_index in result.recovered and (
+                item.line_index not in result.certain
+            ):
+                item.flags.append("price_unconfirmed")
 
     by_item = {item.line_index: item for item in extraction.items}
-    for line_index, (_was, now) in result.changes.items():
+    for line_index, (was, now) in result.changes.items():
         item = by_item.get(line_index)
         if item is None:
             continue
+        if now == 0:
+            # Only nameless lines are offered zero: a repeated price, not a product.
+            extraction.items.remove(item)
+            extraction.removed[line_index] = was
+            continue
         item.line_total_minor = now
-        # On a two-column receipt the unit price is not read separately, it is
-        # the line total at quantity one. Move both or the per-line arithmetic
-        # fails by exactly the correction just made.
+        item.first_read_minor = was
+        # At quantity one the unit price is the line total, so move both.
         if item.quantity_source == "implicit":
             item.unit_price_minor = now
-        # The number came from a different reading than the description did, so
-        # flag the line even though it balances now.
         if "price_reread" not in item.flags:
             item.flags.append("price_reread")
+        if line_index not in result.certain and "price_unconfirmed" not in item.flags:
+            item.flags.append("price_unconfirmed")

@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SteMazzO/quadra-core/schema/receipt-2.0.0.schema.json",
+  "title": "Parsed receipt",
+  "description": "One receipt as read by quadra-core. Money is integer minor units throughout. 'status' is the one field to look at: 'ok' means every figure is backed by the receipt's own arithmetic; 'review' lists in 'review' exactly what a person should check.",
+  "type": "object",
+  "required": ["schema_version", "status", "review", "profile", "currency", "line_items", "adjustments", "totals", "warnings"],
+  "additionalProperties": false,
+  "$defs": {
+    "minor": { "type": "integer" },
+    "minor_or_null": { "type": ["integer", "null"] }
+  },
+  "properties": {
+    "schema_version": { "const": "2.0.0" },
+    "status": { "enum": ["ok", "review", "failed"] },
+
+    "review": {
+      "description": "What a person should check, total first. Empty when status is 'ok'.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "field", "message", "item"],
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "enum": [
+              "no_items",
+              "total_missing",
+              "total_disputed",
+              "total_mismatch",
+              "total_unconfirmed",
+              "price_missing",
+              "price_unconfirmed",
+              "price_implausible",
+              "quantity_unverified",
+              "description_unreadable",
+              "discount_unconfirmed",
+              "line_removed"
+            ]
+          },
+          "field": { "enum": ["total", "items", "price", "quantity", "description", "discount"] },
+          "message": { "type": "string", "description": "Plain words, for showing to a person." },
+          "item": { "type": ["integer", "null"], "description": "Index into line_items, when the reason concerns one." }
+        }
+      }
+    },
+
+    "profile": {
+      "type": "object",
+      "required": ["id", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "version": { "type": "integer", "minimum": 1 }
+      }
+    },
+
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+
+    "line_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["index", "description", "quantity", "unit_price_minor", "line_total_minor", "discount_minor", "vat_code", "confidence", "needs_review", "flags", "line_index", "bbox"],
+        "additionalProperties": false,
+        "properties": {
+          "index": { "type": "integer", "minimum": 0 },
+          "description": { "type": "string" },
+          "quantity": {
+            "description": "A decimal string, not a number, so weighed quantities survive JSON exactly.",
+            "type": ["string", "null"],
+            "pattern": "^\\d+(\\.\\d+)?$"
+          },
+          "unit_price_minor": { "$ref": "#/$defs/minor_or_null" },
+          "line_total_minor": { "$ref": "#/$defs/minor_or_null" },
+          "discount_minor": { "description": "The discounts printed under this item, zero or negative.", "$ref": "#/$defs/minor" },
+          "vat_code": { "type": ["string", "null"] },
+          "confidence": { "description": "How sure the OCR is of the description, 0 to 1.", "type": "number", "minimum": 0, "maximum": 1 },
+          "needs_review": { "type": "boolean" },
+          "flags": { "type": "array", "items": { "type": "string" } },
+          "line_index": { "type": "integer", "minimum": 0 },
+          "bbox": {
+            "description": "[left, top, width, height] in the prepared image's pixels.",
+            "type": "array", "items": { "type": "integer" }, "minItems": 4, "maxItems": 4
+          }
+        }
+      }
+    },
+
+    "adjustments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "label", "amount_minor", "applies_to", "needs_review", "line_index"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string" },
+          "label": { "type": "string" },
+          "amount_minor": { "$ref": "#/$defs/minor" },
+          "applies_to": { "type": ["integer", "null"], "description": "Index of the item it is printed under." },
+          "needs_review": { "type": "boolean" },
+          "line_index": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+
+    "totals": {
+      "type": "object",
+      "required": ["items_subtotal_minor", "discounts_minor", "computed_total_minor", "total_minor", "total_source", "balanced", "delta_minor"],
+      "additionalProperties": false,
+      "properties": {
+        "items_subtotal_minor": { "description": "The line items alone, before discounts.", "$ref": "#/$defs/minor" },
+        "discounts_minor": { "description": "The adjustments, negative.", "$ref": "#/$defs/minor" },
+        "computed_total_minor": { "description": "Subtotal plus discounts: what the total should be.", "$ref": "#/$defs/minor" },
+        "total_minor": { "description": "The total the items are checked against.", "$ref": "#/$defs/minor_or_null" },
+        "total_source": { "enum": ["printed", "payments", "supplied", "none"] },
+        "balanced": { "type": "boolean" },
+        "delta_minor": { "description": "computed_total_minor minus total_minor.", "$ref": "#/$defs/minor_or_null" }
+      }
+    },
+
+    "warnings": {
+      "description": "Notes for debugging. They never change the status.",
+      "type": "array", "items": { "type": "string" }
+    },
+
+    "ocr": {
+      "type": "object",
+      "properties": {
+        "engine_version": { "type": "string" },
+        "psm": { "type": "integer" },
+        "preprocessing": { "type": "array", "items": { "type": "string" } },
+        "mean_word_confidence": { "type": "number" }
+      }
+    }
+  }
+}

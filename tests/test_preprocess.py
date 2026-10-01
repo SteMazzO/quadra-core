@@ -1,9 +1,4 @@
-"""Image preprocessing tests.
-
-Each synthetic image isolates one defect: a known tilt, a known crop, a known
-gradient. On a real photo they all appear at once and a failure says nothing
-about which step caused it.
-"""
+"""Preprocessing tests, each on a synthetic image with one known defect."""
 
 from __future__ import annotations
 
@@ -66,27 +61,18 @@ def test_deskew_recovers_a_known_tilt(tilt):
 
 
 def test_deskew_is_not_fooled_by_uniform_borders():
-    """Regression guard for a measured failure.
-
-    Scoring row-mean *variance* let the desk corners left by a tilt peak at 0 degrees,
-    so deskew never fired and OCR split every line. Adjacent-row contrast fixes it.
-    """
+    """Desk corners left by a tilt don't stop deskew from firing."""
     report = Report((0, 0), (0, 0))
     deskew(crop_to_paper(on_desk(text_page(), tilt=-3.2)), report=report)
     assert abs(report.deskew_degrees) > 1.0, "deskew failed to fire on a clear tilt"
 
 
 def test_crop_survives_a_lighting_gradient():
-    """A fixed threshold clipped the dimly lit edge and shaved off line items.
-
-    Otsu picks the paper/desk split from the histogram instead, so the full page
-    width survives.
-    """
+    """A lighting gradient doesn't shave the dim edge off the page."""
     page = text_page(width=800)
     lit = on_desk(page, gradient=True)
     cropped = crop_to_paper(lit)
     assert cropped.width < lit.width, "nothing was cropped"
-    # The page is 800px inside a 1100px canvas; a correct crop keeps nearly all of it.
     assert cropped.width >= page.width * 0.9, f"crop shaved page to {cropped.width}px"
 
 
@@ -114,17 +100,12 @@ def test_large_enough_images_land_in_the_target_band(width):
 
 
 def test_small_images_are_upscaled_but_capped():
-    """Below the band we upscale toward it, but never past 2x.
-
-    Past that the extra pixels carry no extra information, so the result may sit
-    below MIN_WIDTH by design rather than pretend to a resolution it does not have.
-    """
+    """Small images are upscaled toward the band, at most 2x."""
     result = resize_to_target(Image.new("L", (400, 800), 255))
     assert result.width == 800
 
 
 def test_resize_never_upscales_beyond_double():
-    """Upscaling a blurry capture past a point adds pixels, not information."""
     tiny = Image.new("L", (200, 400), 255)
     assert resize_to_target(tiny).width <= 400
 
