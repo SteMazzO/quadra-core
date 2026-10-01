@@ -40,6 +40,8 @@ class LineItem:
     line_index: int
     bbox: tuple[int, int, int, int]
     flags: list[str] = field(default_factory=list)
+    # The price the first reading gave, when the re-read replaced it.
+    first_read_minor: int | None = None
 
 
 ITEM_CANDIDATE_RULES = frozenset({"item", "unknown", "discount"})
@@ -53,6 +55,8 @@ class Adjustment:
     label: str
     amount_minor: int
     line_index: int
+    # Set when the re-read suggested the amount but could not be sure of it.
+    unconfirmed: bool = False
 
 
 @dataclass(slots=True)
@@ -87,6 +91,10 @@ class Extraction:
     warnings: list[str] = field(default_factory=list)
     # Lines that looked like products but had no readable price.
     skipped_lines: list[int] = field(default_factory=list)
+    # Line index -> price of nameless lines the re-read dropped as a repeated price.
+    removed: dict[int, int] = field(default_factory=dict)
+    # Where the VAT brackets sit, as a fraction of the text width, if found.
+    vat_column: float | None = None
 
 
 def find_item_region(lines: list[Line], profile: Profile) -> tuple[int, int]:
@@ -128,20 +136,42 @@ _STARTS_WITH_SEPARATOR = re.compile(r"^[,.;:]\d")
 _COLUMN_MARGIN = 0.03
 _COLUMN_DRIFT = 0.2
 
-# Shadows at the paper's edge come back as low-confidence one-letter words.
-_EDGE_NOISE_CONF = 60.0
+# Creases and shadows come back as punctuation or stray letters around the name.
+_EDGE_NOISE_CONF = 80.0
+_TRAILING_NOISE_CONF = 40.0
+
+_TALL_LINE_RATIO = 1.9
+
+# How far from the VAT column a word may sit and still be read as the bracket.
+_VAT_MARGIN = 0.06
 
 
-def _strip_leading_noise(words: list[Word]) -> list[Word]:
-    """Drop single-character low-confidence words from the front of a description."""
-    first = 0
-    while (
-        first < len(words)
-        and len(words[first].text) == 1
-        and words[first].conf < _EDGE_NOISE_CONF
-    ):
+def _is_noise(word: Word) -> bool:
+    """Whether a word at either end of a description is junk, not part of the name."""
+    if not any(c.isalnum() for c in word.text):
+        return True
+    return (
+        len(word.text) == 1 and not word.text.isdigit() and word.conf < _EDGE_NOISE_CONF
+    )
+
+
+def _is_trailing_noise(word: Word) -> bool:
+    """Tell whether a short unsure word after a name is a speck, as in 'SHOPPER vi'."""
+    return _is_noise(word) or (
+        len(word.text) <= 2
+        and not any(c.isdigit() for c in word.text)
+        and word.conf < _TRAILING_NOISE_CONF
+    )
+
+
+def strip_noise(words: list[Word]) -> list[Word]:
+    """Drop junk words from both ends of a description."""
+    first, last = 0, len(words)
+    while first < last and _is_noise(words[first]):
         first += 1
-    return words[first:] or words
+    while last > first + 1 and _is_trailing_noise(words[last - 1]):
+        last -= 1
+    return words[first:last] or words
 
 
 def _trim(text: str) -> str:
@@ -315,6 +345,77 @@ def price_candidates(
     return []
 
 
+def name_words(words: list[Word], block: Block, vat_column: float | None) -> list[Word]:
+    """Return the words that name a line: left of the VAT column, junk trimmed."""
+    if vat_column is not None:
+        words = [w for w in words if block.fraction(w.cx) < vat_column - _VAT_MARGIN]
+    return strip_noise(words) if words else []
+
+
+def find_vat_column(
+    lines: list[Line],
+    profile: Profile,
+    block: Block,
+    price_column: tuple[float, float] | None,
+) -> float | None:
+    """Where the VAT brackets sit, as a fraction of the block width, or None."""
+    if profile.vat_code_re is None:
+        return None
+    spots = []
+    for line in lines:
+        priced = price_candidates(
+            line, _money_tokens(line, profile), block, price_column
+        )
+        if not priced or not priced[-1][0]:
+            continue
+        word = line.words[priced[-1][0] - 1]
+        if read_vat_code(word.text, profile) is not None:
+            spots.append(block.fraction(word.cx))
+    # One bracket-shaped word is not a column.
+    if len(spots) < 2:
+        return None
+    return sorted(spots)[len(spots) // 2]
+
+
+def _split_vat(
+    line: Line,
+    profile: Profile,
+    block: Block,
+    total_idx: int,
+    vat_column: float | None,
+) -> tuple[int, str | None]:
+    """Return where the description ends, and the VAT code if one was read."""
+    if vat_column is None:
+        # No column to go by: the bracket is the word just left of the price.
+        vat_code = (
+            read_vat_code(line.words[total_idx - 1].text, profile)
+            if total_idx
+            else None
+        )
+        return (total_idx - 1 if vat_code else total_idx), vat_code
+
+    # From the VAT column rightwards there is only the bracket and crease noise.
+    desc_end = total_idx
+    for index, word in enumerate(line.words[:total_idx]):
+        if block.fraction(word.cx) >= vat_column - _VAT_MARGIN:
+            desc_end = index
+            break
+    for word in line.words[desc_end:total_idx]:
+        if abs(block.fraction(word.cx) - vat_column) <= _VAT_MARGIN:
+            vat_code = read_vat_code(word.text, profile)
+            if vat_code is not None:
+                return desc_end, vat_code
+    return desc_end, None
+
+
+def description_confidence(words: list[Word]) -> float:
+    """How sure the OCR is of a name: the mean over its words, 0 to 1.
+
+    Not the minimum, since Tesseract scores correct abbreviations like 'ESSEL.X6' low.
+    """
+    return round(sum(w.conf for w in words) / len(words) / 100, 3)
+
+
 def extract_item(
     line: Line,
     profile: Profile,
@@ -322,6 +423,7 @@ def extract_item(
     price_column: tuple[float, float] | None,
     *,
     money: list[tuple[int, int, int]] | None = None,
+    vat_column: float | None = None,
 ) -> LineItem | None:
     """Pull one item out of a line, or None if the line holds no price."""
     money = _money_tokens(line, profile) if money is None else money
@@ -333,16 +435,10 @@ def extract_item(
     resolved = _resolve_quantity(
         line, profile, money, total_idx=total_idx, total_minor=total_minor
     )
-    desc_end = resolved.desc_end
+    vat_end, vat_code = _split_vat(line, profile, block, total_idx, vat_column)
+    desc_end = min(resolved.desc_end, vat_end)
 
-    # The VAT bracket sits just left of the price; keep it out of the description.
-    vat_code = (
-        read_vat_code(line.words[total_idx - 1].text, profile) if total_idx else None
-    )
-    if vat_code is not None:
-        desc_end = min(desc_end, total_idx - 1)
-
-    desc_words = _strip_leading_noise(line.words[:desc_end])
+    desc_words = strip_noise(line.words[:desc_end])
     description_raw = " ".join(w.text for w in desc_words).strip()
     if not description_raw:
         return None
@@ -355,8 +451,7 @@ def extract_item(
         unit_price_minor=resolved.unit_minor,
         line_total_minor=total_minor,
         vat_code=vat_code,
-        # One bad word makes the whole description suspect, so take the worst.
-        confidence=round(min(w.conf for w in desc_words) / 100, 3),
+        confidence=description_confidence(desc_words),
         line_index=line.index,
         bbox=(line.left, line.top, line.right - line.left, line.bottom - line.top),
         flags=resolved.flags,
@@ -437,6 +532,7 @@ def extract(lines: list[Line], profile: Profile) -> Extraction:
     block = text_block(lines)
     column = discover_price_column(lines, profile.money_re)
     start, end = find_item_region(lines, profile)
+    vat_column = find_vat_column(lines[start:end], profile, block, column)
 
     items: list[LineItem] = []
     adjustments: list[Adjustment] = []
@@ -444,11 +540,15 @@ def extract(lines: list[Line], profile: Profile) -> Extraction:
     warnings: list[str] = []
     skipped: list[int] = []
 
+    glyph = median_glyph_height([w for line in lines for w in line.words])
     for line in lines[start:end]:
         rule = profile.rule_for(line.text)
 
         # An allow list, so a new profile rule never turns its lines into items.
         if rule not in ITEM_CANDIDATE_RULES:
+            continue
+        # A misread 'TOTALE EURO' matches no rule, but is still printed tall.
+        if median_glyph_height(line.words) > glyph * _TALL_LINE_RATIO:
             continue
 
         modifier = parse_modifier(line, profile)
@@ -467,11 +567,16 @@ def extract(lines: list[Line], profile: Profile) -> Extraction:
         amount = priced[-1][2]
         if amount < 0 or rule == "discount":
             first = min(f for f, _l, _v in money)
-            label = " ".join(w.text for w in line.words[:first]).strip()
-            adjustments.append(Adjustment("discount", label, amount, line.index))
+            label = " ".join(
+                w.text for w in name_words(line.words[:first], block, vat_column)
+            )
+            # A discount whose minus sign was lost is still a discount.
+            adjustments.append(Adjustment("discount", label, -abs(amount), line.index))
             continue
 
-        item = extract_item(line, profile, block, column, money=money)
+        item = extract_item(
+            line, profile, block, column, money=money, vat_column=vat_column
+        )
         if item is not None:
             items.append(item)
 
@@ -489,4 +594,5 @@ def extract(lines: list[Line], profile: Profile) -> Extraction:
         printed_total,
         warnings=warnings,
         skipped_lines=skipped,
+        vat_column=vat_column,
     )

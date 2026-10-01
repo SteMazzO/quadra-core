@@ -1,4 +1,10 @@
-"""Re-read the price column when a receipt does not balance."""
+"""Re-read the price column when a receipt does not balance.
+
+The arithmetic proposes; it never has the last word. A correction is taken as
+certain only when the total was confirmed by two readings and every re-read of
+the column agrees on the new price. Anything less is kept as a suggestion and the
+line goes to review.
+"""
 
 from __future__ import annotations
 
@@ -12,10 +18,14 @@ from quadra_core.pipeline.extract import (
     Adjustment,
     Extraction,
     LineItem,
+    description_confidence,
+    name_words,
     parse_amount,
     read_vat_code,
+    strip_noise,
 )
 from quadra_core.pipeline.lines import (
+    Block,
     Line,
     Word,
     cluster_1d,
@@ -23,6 +33,7 @@ from quadra_core.pipeline.lines import (
     group_lines,
     load_tsv,
     median_glyph_height,
+    text_block,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -48,6 +59,39 @@ _MERGED_ROW_RATIO = 1.5
 # A product name has at least two letters in a row.
 _NAMED = re.compile(r"[^\W\d_]{2,}")
 
+# How many re-reads must agree, and none disagree, for a correction to be certain.
+CERTAIN_READINGS = 2
+
+# Misreads seen in the price column on its own, where every row is a price.
+# '1,20=S' for '1,20-S'; the dashes are en and em.
+_SIGN_LIKE = re.compile("[-=~\u2013\u2014]" + r"\s*\S?\s*$")
+_LOST_LEADING_ONE = re.compile(r"^[^\d,.]?(?=[,.]\d{2}$)")  # '»,98' for '1,98'
+_ODD_SEPARATOR = re.compile(r"(?<=\d)\D(?=\d{2}$)")  # '1}20' for '1,20'
+_NO_SEPARATOR = re.compile(r"\d{3}")  # '449' for '4,49'
+
+
+def read_cell(text: str, profile: Profile) -> int | None:
+    """Read one row of the price column, allowing for how thermal print misreads.
+
+    Only used for the column re-read: every row there is a price, and the total
+    decides between readings, so a wrong guess here is outvoted, not trusted.
+    """
+    amount = parse_amount(text, profile)
+    if amount is not None or profile.decimal_places != 2:
+        return amount
+
+    negative = bool(_SIGN_LIKE.search(text))
+    core = _SIGN_LIKE.sub("", text).strip()
+    core = _LOST_LEADING_ONE.sub("1", core, count=1)
+    core = _ODD_SEPARATOR.sub(profile.decimal_separator, core, count=1)
+    core = core.lstrip(".,;:'\u2018\u2019")
+    if _NO_SEPARATOR.fullmatch(core):
+        core = f"{core[0]}{profile.decimal_separator}{core[1:]}"
+    amount = parse_amount(core, profile)
+    if amount is None:
+        return None
+    return -abs(amount) if negative else amount
+
 
 @dataclass(slots=True)
 class Repair:
@@ -57,6 +101,8 @@ class Repair:
     changes: dict[int, tuple[int, int]] = field(default_factory=dict)
     # Line index -> amount for lines the first pass dropped; negative for a discount.
     recovered: dict[int, int] = field(default_factory=dict)
+    # Line indexes whose new amount is certain; every other change needs review.
+    certain: set[int] = field(default_factory=set)
     disputed: int = 0
     # Where a recovered line's description ends, in page pixels.
     column_left: int | None = None
@@ -159,7 +205,7 @@ def second_opinion(
     for scale, psm in READINGS:
         rows = _column_rows(prepared, left, right, scale, psm)
         for index, text in _assign(rows, positions, column.glyph).items():
-            amount = parse_amount(text, profile)
+            amount = read_cell(text, profile)
             if amount is not None:
                 out.setdefault(index, []).append(amount)
     return out
@@ -276,6 +322,10 @@ def repair(
     target = validation.printed_total_minor
     if target is None or validation.delta_minor == 0 or not extraction.items:
         return None
+    # The printed total and the payments disagree: aiming at either could bend
+    # correct prices to a misread total.
+    if validation.total_disputed:
+        return None
 
     column = survey(lines, extraction)
     readings = second_opinion(prepared, column, profile)
@@ -295,30 +345,67 @@ def repair(
     if chosen is None:
         return None
 
-    first = {item.line_index: item.line_total_minor for item in extraction.items}
     result = Repair(disputed=len(disputed), column_left=column.left)
-    for (index, _votes), amount in zip(disputed, chosen, strict=True):
-        if index not in first:
-            # A dropped line; zero means leave it dropped.
-            if amount:
-                result.recovered[index] = amount
-        elif amount != first[index]:
-            result.changes[index] = (first[index], amount)
+    _record(result, extraction, disputed, chosen, validation.total_confirmed)
     return result if result.applied else None
 
 
+def _record(
+    result: Repair,
+    extraction: Extraction,
+    disputed: list[tuple[int, Counter[int]]],
+    chosen: list[int],
+    total_confirmed: bool,
+) -> None:
+    """Write what the choice changed into the repair, and which of it is certain."""
+    first = {item.line_index: item.line_total_minor for item in extraction.items}
+    for (index, votes), amount in zip(disputed, chosen, strict=True):
+        if index not in first:
+            # A dropped line; zero means leave it dropped.
+            if not amount:
+                continue
+            result.recovered[index] = amount
+        elif amount != first[index]:
+            result.changes[index] = (first[index], amount)
+        else:
+            continue
+        if total_confirmed and _unanimous(votes, amount, index in first):
+            result.certain.add(index)
+
+
+def _unanimous(votes: Counter[int], amount: int, has_first_reading: bool) -> bool:
+    """Whether every re-read of the column says `amount`, and enough of them do."""
+    # Dropping a line is never read off the column, so it is never certain.
+    if amount == 0:
+        return False
+    rereads = sum(votes.values()) - (1 if has_first_reading else 0)
+    return votes[amount] >= CERTAIN_READINGS and votes[amount] == rereads
+
+
 def _describing_words(
-    line: Line, column_left: int | None, profile: Profile
+    line: Line,
+    column_left: int | None,
+    profile: Profile,
+    block: Block,
+    vat_column: float | None,
 ) -> tuple[list[Word], str | None]:
-    """Return a recovered line's words left of the price column, and its VAT code."""
+    """Return a recovered line's name, left of the price column, and its VAT code."""
     words = [
         w for w in line.words if column_left is None or w.cx < column_left
     ] or line.words
+    if vat_column is not None:
+        named = name_words(words, block, vat_column) or strip_noise(words)
+        for word in words:
+            if word not in named:
+                vat_code = read_vat_code(word.text, profile)
+                if vat_code is not None:
+                    return named, vat_code
+        return named, None
     if len(words) > 1:
         vat_code = read_vat_code(words[-1].text, profile)
         if vat_code is not None:
-            return words[:-1], vat_code
-    return words, None
+            return strip_noise(words[:-1]), vat_code
+    return strip_noise(words), None
 
 
 def _recovered_item(
@@ -334,7 +421,7 @@ def _recovered_item(
         unit_price_minor=price,
         line_total_minor=price,
         vat_code=vat_code,
-        confidence=round(min(w.conf for w in words) / 100, 3),
+        confidence=description_confidence(words),
         line_index=line.index,
         bbox=(line.left, line.top, line.right - line.left, line.bottom - line.top),
         flags=["line_recovered"],
@@ -346,15 +433,24 @@ def _recover(
 ) -> None:
     """Add back the lines the first pass dropped, as items or as discounts."""
     by_index = {line.index: line for line in lines}
+    block = text_block(lines)
     for line_index, amount in sorted(result.recovered.items()):
         line = by_index.get(line_index)
         if line is None:
             continue
-        words, vat_code = _describing_words(line, result.column_left, profile)
+        words, vat_code = _describing_words(
+            line, result.column_left, profile, block, extraction.vat_column
+        )
         if amount < 0:
             label = " ".join(" ".join(w.text for w in words).split())
             extraction.adjustments.append(
-                Adjustment("discount", label, amount, line_index)
+                Adjustment(
+                    "discount",
+                    label,
+                    amount,
+                    line_index,
+                    unconfirmed=line_index not in result.certain,
+                )
             )
         else:
             extraction.items.append(_recovered_item(line, words, amount, vat_code))
@@ -369,22 +465,35 @@ def _recover(
 def apply(
     extraction: Extraction, result: Repair, lines: list[Line], profile: Profile
 ) -> None:
-    """Write the agreed prices back, and flag everything that moved."""
+    """Write the agreed prices back, and flag everything that moved.
+
+    A change that is not certain carries `price_unconfirmed`, which sends the line
+    to review with the arithmetic's answer as a suggestion.
+    """
     if result.recovered:
         _recover(extraction, result, lines, profile)
+        for item in extraction.items:
+            if item.line_index in result.recovered and (
+                item.line_index not in result.certain
+            ):
+                item.flags.append("price_unconfirmed")
 
     by_item = {item.line_index: item for item in extraction.items}
-    for line_index, (_was, now) in result.changes.items():
+    for line_index, (was, now) in result.changes.items():
         item = by_item.get(line_index)
         if item is None:
             continue
         if now == 0:
             # Only nameless lines are offered zero: a repeated price, not a product.
             extraction.items.remove(item)
+            extraction.removed[line_index] = was
             continue
         item.line_total_minor = now
+        item.first_read_minor = was
         # At quantity one the unit price is the line total, so move both.
         if item.quantity_source == "implicit":
             item.unit_price_minor = now
         if "price_reread" not in item.flags:
             item.flags.append("price_reread")
+        if line_index not in result.certain and "price_unconfirmed" not in item.flags:
+            item.flags.append("price_unconfirmed")

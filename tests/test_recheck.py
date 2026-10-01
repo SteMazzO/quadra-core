@@ -36,8 +36,10 @@ def extraction(totals: list[int]) -> Extraction:
     )
 
 
-def validation(printed: int | None, delta: int) -> Validation:
-    return Validation(status="partial", printed_total_minor=printed, delta_minor=delta)
+def validation(printed: int | None, delta: int, *, confirmed=False) -> Validation:
+    return Validation(
+        printed_total_minor=printed, delta_minor=delta, total_confirmed=confirmed
+    )
 
 
 def repair_with(totals, printed, second, monkeypatch):

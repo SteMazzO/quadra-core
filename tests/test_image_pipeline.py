@@ -56,33 +56,35 @@ def photo(tmp_path_factory):
 
 
 def test_a_rendered_receipt_parses_and_balances(photo):
-    document, status = parse_image(photo, profile_id="esselunga")
-    assert status == "ok", document["validation"]["warnings"]
+    result = parse_image(photo, profile="esselunga")
+    document = result.document
+    assert result.status == "ok", document["review"]
     assert [i["line_total_minor"] for i in document["line_items"]] == [230, 149]
     assert [a["amount_minor"] for a in document["adjustments"]] == [-45]
     assert document["totals"] == {
         "items_subtotal_minor": 379,
         "discounts_minor": -45,
-        "printed_total_minor": 334,
         "computed_total_minor": 334,
+        "total_minor": 334,
+        "total_source": "printed",
         "balanced": True,
         "delta_minor": 0,
     }
 
 
 def test_the_shop_is_recognised_without_being_named(photo):
-    document, _ = parse_image(photo, profile_id=None)
+    document = parse_image(photo).document
     assert document["profile"]["id"] == "esselunga"
-    assert document["profile"]["match_confidence"] > 0.5
 
 
 def test_the_ocr_and_the_image_it_read_come_back_for_archiving(photo):
-    document, _ = parse_image(photo, profile_id="esselunga")
-    assert document["_tsv"].splitlines()[0].startswith("level")
+    result = parse_image(photo, profile="esselunga")
+    document = result.document
+    assert result.tsv.splitlines()[0].startswith("level")
     # Item boxes are in the prepared image's coordinates, so they must fit it.
-    prepared = document["_prepared"]
+    prepared = result.image
     for item in document["line_items"]:
-        left, top, width, height = item["provenance"]["bbox"]
+        left, top, width, height = item["bbox"]
         assert left >= 0 and left + width <= prepared.width
         assert top >= 0 and top + height <= prepared.height
     assert document["ocr"]["engine_version"].startswith("tesseract")

@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 import io
 import os
-import resource
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -61,6 +60,10 @@ def _base_flags(psm: int, oem: int, lang: str) -> list[str]:
 
 def _limit_memory(pid: int) -> bool:
     """Cap a running child's address space. Returns whether the cap was set."""
+    try:
+        import resource  # noqa: PLC0415 - Unix only
+    except ImportError:  # pragma: no cover - Windows
+        return False
     prlimit = getattr(resource, "prlimit", None)
     if prlimit is None:  # pragma: no cover - not Linux
         return False
@@ -98,10 +101,11 @@ def engine_version() -> str:
 def _child_env(threads: int) -> dict[str, str]:
     """Build a fixed environment, so no ambient locale changes how numbers read."""
     env = {"OMP_THREAD_LIMIT": str(threads), "PATH": "/usr/bin:/bin", "LC_ALL": "C"}
-    # Needed by installs that keep language data outside the Debian layout.
-    tessdata = os.environ.get("TESSDATA_PREFIX")
-    if tessdata:
-        env["TESSDATA_PREFIX"] = tessdata
+    # TESSDATA_PREFIX for installs that keep language data elsewhere; SYSTEMROOT
+    # because Windows programs cannot start without it.
+    for name in ("TESSDATA_PREFIX", "SYSTEMROOT"):
+        if os.environ.get(name):
+            env[name] = os.environ[name]
     return env
 
 

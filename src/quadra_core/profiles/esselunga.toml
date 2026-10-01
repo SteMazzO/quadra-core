@@ -9,8 +9,8 @@ decimal_separator = ","
 decimal_places = 2
 money = '\d{1,3},\d{2}'
 # The VAT bracket, e.g. '*c'. OCR mangles the asterisk, so match on shape;
-# the captured group is the letter.
-vat_code = '\W{0,2}[A-Za-z]?([A-Za-z])\W{0,2}'
+# the captured group is the letter. Only real brackets: a misread '*e' is no code.
+vat_code = '\W{0,2}[A-Za-z]?([A-Da-d])\W{0,2}'
 max_quantity = 100
 
 [layout]
@@ -21,13 +21,14 @@ modifier_position = "before"
 
 [fingerprint]
 # The VAT number identifies the company, not a single branch.
-anchors = ["Esselunga S.p.A.", "04916380159"]
+anchors = ["Esselunga S.p.A.", "04916380159", "FIDATY"]
 min_ratio = 0.8
 
 [regions]
 # 'EURO' also matches the 'TOTALE EURO' line; find_item_region allows for that.
 items_start_after = ["EURO"]
-items_end_before = ["TOTALE EURO"]
+# The later anchors end the items when the total itself is unreadable.
+items_end_before = ["TOTALE EURO", "DI CUI IVA", "PAGAMENTO"]
 
 [[rules]]
 name = "total"
@@ -48,4 +49,5 @@ pattern = '(?i)\bsconto\b'
 
 [[rules]]
 name = "noise"
-pattern = '(?i)(carta\s+fidaty|raccolta\s+punti|saldo|punti|p\.i\.|^\s*euro\s*$)'
+# 'di cui IVA' and the '*a = IVA 04%' legend carry amounts that are not items.
+pattern = '(?i)(carta\s+fidaty|raccolta\s+punti|saldo|punti|p\.i\.|^\s*euro\s*$|di\s+cui|\biva\s*\d)'

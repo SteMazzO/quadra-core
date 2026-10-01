@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 
-from quadra_core.cli import EXIT_ERROR, EXIT_OK, EXIT_PARTIAL, main
+import pytest
+
+from quadra_core.cli import EXIT_ERROR, EXIT_OK, EXIT_REVIEW, amount, main
 from quadra_core.testdata import OCR as FIXTURES
 
 
@@ -17,12 +20,12 @@ def test_a_clean_receipt_prints_json_and_exits_ok(capsys):
     assert len(document["line_items"]) == 9
 
 
-def test_a_receipt_that_does_not_add_up_exits_partial(capsys):
+def test_a_receipt_that_does_not_add_up_exits_review(capsys):
     code = main(
         ["parse", str(FIXTURES / "synthetic_unbalanced.tsv"), "--profile", "synthetic"]
     )
     capsys.readouterr()
-    assert code == EXIT_PARTIAL
+    assert code == EXIT_REVIEW
 
 
 def test_a_typed_in_total_reaches_the_document(capsys):
@@ -33,11 +36,12 @@ def test_a_typed_in_total_reaches_the_document(capsys):
             "--profile",
             "esselunga",
             "--total",
-            "9999",
+            "99,99",
         ]
     )
     document = json.loads(capsys.readouterr().out)
-    assert document["totals"]["printed_total_minor"] == 9999
+    assert document["totals"]["total_minor"] == 9999
+    assert document["totals"]["total_source"] == "supplied"
 
 
 def test_an_unknown_profile_is_an_error_not_a_traceback(capsys):
@@ -63,8 +67,21 @@ def test_tsv_arrives_on_stdin_too(capsys, monkeypatch):
     assert len(document["line_items"]) == 9
 
 
-def test_the_private_keys_never_reach_the_json(capsys):
-    main(["parse", str(FIXTURES / "esselunga_b.tsv"), "--profile", "esselunga"])
-    document = json.loads(capsys.readouterr().out)
-    assert "_tsv" not in document
-    assert "_prepared" not in document
+@pytest.mark.parametrize(
+    "text,cents", [("101,25", 10125), ("101.25", 10125), ("101", 10100), ("0,1", 10)]
+)
+def test_a_total_is_typed_the_way_it_is_printed(text, cents):
+    assert amount(text) == cents
+
+
+@pytest.mark.parametrize("text", ["0", "-5", "1,234", "abc"])
+def test_a_total_that_is_not_an_amount_is_refused(text):
+    with pytest.raises(argparse.ArgumentTypeError):
+        amount(text)
+
+
+def test_a_file_that_is_not_text_is_an_error_not_a_traceback(tmp_path, capsys):
+    photo = tmp_path / "receipt.heic"
+    photo.write_bytes(b"\xff\xd8\xff\xe0 not text")
+    assert main(["parse", str(photo), "--profile", "esselunga"]) == EXIT_ERROR
+    assert capsys.readouterr().err.startswith("error:")

@@ -275,13 +275,23 @@ def autocontrast(image: Image.Image) -> Image.Image:
     return ImageOps.autocontrast(image, cutoff=1)
 
 
-def preprocess(path: Path) -> tuple[Image.Image, Report]:
-    """Full pipeline: photograph in, OCR-ready grayscale out."""
+def preprocess(
+    path: Path, *, flat_field_scale: float | None = None
+) -> tuple[Image.Image, Report]:
+    """Full pipeline: photograph in, OCR-ready grayscale out.
+
+    `flat_field_scale` sets the lighting correction's radius as a fraction of the
+    width; a small one irons out creases that the default leaves in.
+    """
     report = Report(source_size=(0, 0), output_size=(0, 0))
     image = load_grayscale(path, report)
     image = crop_to_paper(image, report)
     image = deskew(image, report=report)
-    image = flat_field(image, report=report)
+    if flat_field_scale is None:
+        image = flat_field(image, report=report)
+    else:
+        radius = max(5, round(image.width * flat_field_scale))
+        image = flat_field(image, radius=radius, report=report)
     image = resize_to_target(image, report=report)
     image = autocontrast(image)
     image = add_margin(image)

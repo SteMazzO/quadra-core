@@ -13,10 +13,10 @@ from quadra_core.pipeline.extract import (
     LineItem,
     Modifier,
     _attach,
-    _strip_leading_noise,
     extract,
     extract_item,
     find_item_region,
+    strip_noise,
 )
 from quadra_core.pipeline.lines import (
     Line,
@@ -27,6 +27,7 @@ from quadra_core.pipeline.lines import (
     text_block,
 )
 from quadra_core.pipeline.money import normalize_separators, parse_money
+from quadra_core.pipeline.review import reasons, status
 from quadra_core.pipeline.validate import validate
 from quadra_core.profiles import loader
 from quadra_core.testdata import OCR as FIXTURES
@@ -60,8 +61,9 @@ def run(name: str):
     ],
 )
 def test_receipts_parse_and_balance(name, total):
-    _, v = run(name)
-    assert v.status == "ok", f"warnings: {v.warnings}"
+    ex, v = run(name)
+    found = reasons(ex, v, esselunga())
+    assert status(ex, found) == "ok", found
     assert v.balanced and v.delta_minor == 0
     assert v.printed_total_minor == total
 
@@ -192,11 +194,11 @@ def test_real_photograph_recovers_the_total_from_the_payment_lines():
     assert v.balanced and v.delta_minor == 0
 
 
-def test_fallback_is_recorded_and_still_routed_to_review():
-    """A total taken from the payments still leaves the receipt partial."""
-    _, v = run("esselunga_photo")
-    assert v.status == "partial"
+def test_a_total_taken_from_the_payments_is_recorded():
+    """The items and the payments agree on their own, so no review is needed."""
+    ex, v = run("esselunga_photo")
     assert "printed_total_unreadable_used_payments" in v.warnings
+    assert status(ex, reasons(ex, v, esselunga())) == "ok"
 
 
 def test_change_is_subtracted_from_amounts_tendered():
@@ -216,11 +218,23 @@ def test_printed_total_wins_when_both_are_readable():
     assert v.total_source == "printed"
 
 
-def test_disagreement_between_the_two_totals_is_reported():
+def test_a_misread_payment_loses_to_the_items_and_the_printed_total():
     ex, _ = run("esselunga_b")
     ex.payments_minor = [9999]
     v = validate(ex, esselunga())
-    assert any("payments_disagree" in w for w in v.warnings)
+    assert "payment_misread:9999" in v.warnings
+    assert v.total_confirmed and v.balanced
+
+
+def test_totals_that_nothing_can_reconcile_go_to_review():
+    ex, _ = run("esselunga_b")
+    ex.payments_minor = [9999]
+    ex.items[0].line_total_minor += 1
+    v = validate(ex, esselunga())
+    assert v.total_disputed
+    [reason] = [r for r in reasons(ex, v, esselunga()) if r.field == "total"]
+    assert reason.code == "total_disputed"
+    assert reason.message == "The total reads 26,44 but the payment reads 99,99."
 
 
 def test_loyalty_card_is_scrubbed_from_the_committed_fixture():
@@ -336,15 +350,24 @@ def test_the_vat_bracket_is_not_part_of_the_product_name():
         assert not stray, item.description
 
 
-def test_every_line_on_this_receipt_has_its_bracket_read():
+def test_nearly_every_bracket_on_this_receipt_is_read():
     _, ex = curled()
-    assert all(i.vat_code for i in ex.items)
+    assert sum(1 for i in ex.items if i.vat_code) >= len(ex.items) - 4
+
+
+def test_a_bracket_that_reads_as_no_real_code_is_left_empty():
+    """'*c' read as 'xe' is no bracket Esselunga prints, so no code, not 'e'."""
+    _, ex = curled()
+    assert {i.vat_code for i in ex.items} <= {"a", "b", "c", "d", None}
+    patate = [i for i in ex.items if i.description == "PATATE AL FORNO"]
+    assert [i.vat_code for i in patate] == [None, None]
 
 
 def test_the_bracket_is_the_letter_not_whatever_the_asterisk_became():
     """OCR mangles the asterisk; only the letter counts."""
     _, ex = curled()
-    assert all(len(i.vat_code) == 1 and i.vat_code.islower() for i in ex.items)
+    codes = [i.vat_code for i in ex.items if i.vat_code]
+    assert all(len(code) == 1 and code.islower() for code in codes)
 
 
 def test_the_brackets_group_the_receipt_the_way_the_tax_does():
@@ -541,13 +564,24 @@ def test_edge_noise_is_stripped_from_the_front_of_a_description():
 def test_a_description_is_never_stripped_away_entirely():
     """Stripping never removes the whole description."""
     words = [Word("i", 0, 0, 10, 27, 12.5), Word("s", 20, 0, 10, 20, 4.8)]
-    assert _strip_leading_noise(words) == words
+    assert strip_noise(words) == words
 
 
 def test_a_confident_leading_word_is_kept():
     """'8 LOACKER CREAMKAKAO' really does start with an 8."""
     words = [Word("8", 0, 0, 10, 20, 87.0), Word("LOACKER", 30, 0, 90, 20, 92.2)]
-    assert _strip_leading_noise(words) == words
+    assert strip_noise(words) == words
+
+
+def test_crease_junk_is_stripped_from_the_end_of_a_description():
+    """'BAGNOVIDAL ALM KARITE | “' is really 'BAGNOVIDAL ALM KARITE'."""
+    words = [
+        Word("KARITE", 0, 0, 60, 20, 59.0),
+        Word("|", 70, 0, 5, 40, 17.0),
+        Word("“", 80, 0, 10, 20, 63.0),
+        Word("vi", 90, 0, 10, 10, 32.0),
+    ]
+    assert [w.text for w in strip_noise(words)] == ["KARITE"]
 
 
 # --- the same photograph, with its rows merged over the crease --------------
