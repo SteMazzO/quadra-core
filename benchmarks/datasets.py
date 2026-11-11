@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import urllib.request
 from collections.abc import Callable, Iterator
+from decimal import Decimal
 from pathlib import Path
 
 from scoring import Item, Sample, Truth, digits, quantity
@@ -105,4 +106,110 @@ def cord(cache: Path, split: str) -> Iterator[Sample]:
         )
 
 
-DATASETS: dict[str, Callable[[Path, str], Iterator[Sample]]] = {"cord": cord}
+def _cents(value) -> int | None:
+    return None if value is None else round(float(value) * 100)
+
+
+def _day_first(text: str | None) -> str | None:
+    """'01/06/2022' as Italy, Germany, France and Britain write it -> '2022-06-01'."""
+    parts = (text or "").replace(".", "/").replace("-", "/").split("/")
+    if len(parts) != 3:
+        return None
+    day, month, year = parts
+    return f"{year}-{month:0>2}-{day:0>2}"
+
+
+SYNTHETIC_FILE = "eval-00000-of-00002.parquet"
+
+
+def synthetic(cache: Path, split: str) -> Iterator[Sample]:
+    """Yield rendered receipts of one locale: IT, DE, FR, UK or US.
+
+    albertobarnabo/synthetic-receipts-ocr (Apache-2.0). Every label is exact, but
+    the receipts are generated from a few templates: use it to catch regressions,
+    never to claim accuracy on real paper.
+    """
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    repo = f"{HUB}/albertobarnabo/synthetic-receipts-ocr"
+    url = f"{repo}/resolve/main/data/{SYNTHETIC_FILE}"
+    table = pq.read_table(_fetch(url, cache / "synthetic" / SYNTHETIC_FILE))
+    for row in table.to_pylist():
+        if row["locale"] != split.upper():
+            continue
+        fields = json.loads(row["fields"])
+        taxes = fields.get("taxes") or []
+        yield Sample(
+            id=f"synthetic-{row['id']}",
+            image=row["image_photo"]["bytes"],
+            words=[
+                (w["text"], w["x0"], w["y0"], w["x1"] - w["x0"], w["y1"] - w["y0"])
+                for w in json.loads(row["words"])
+            ],
+            truth=Truth(
+                items=[
+                    Item(line["name"], _cents(line["total"]), Decimal(str(line["qty"])))
+                    for line in fields["lines"]
+                ],
+                total=_cents(fields["total"]),
+                subtotal=_cents(fields.get("subtotal")),
+                tax=sum(_cents(t["amount"]) for t in taxes) if taxes else None,
+                merchant=fields.get("merchant"),
+                date=None if split.upper() == "US" else _day_first(fields.get("date")),
+            ),
+        )
+
+
+OPEN_PRICES = "https://prices.openfoodfacts.org/img"
+
+
+def openprices(cache: Path, split: str) -> Iterator[Sample]:
+    """Yield real receipt photos from one country of Open Prices, e.g. IT.
+
+    Open Food Facts volunteers photograph a receipt and type in some of its
+    prices (data ODbL, images CC BY-SA 4.0). Usually only one or two prices are
+    entered and the total almost never, so this measures whether known prices
+    are found on real paper from many chains, not whether a receipt is complete.
+    """
+    import pyarrow.compute as pc  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    url = f"{HUB}/openfoodfacts/open-prices/resolve/main/prices.parquet"
+    table = pq.read_table(_fetch(url, cache / "openprices" / "prices.parquet"))
+    country = pc.equal(table["location_osm_address_country_code"], split.upper())
+    rows = table.filter(pc.and_(country, pc.equal(table["proof_type"], "RECEIPT")))
+
+    receipts: dict[int, list[dict]] = {}
+    for row in rows.to_pylist():
+        receipts.setdefault(row["proof_id"], []).append(row)
+    for proof, prices in sorted(receipts.items()):
+        first = prices[0]
+        # A price per kilo, or for several units, is not the line's printed total.
+        items = [
+            Item(row["product_name"] or "", _cents(row["price"]))
+            for row in prices
+            if row["price"]
+            and not row["price_per"]
+            and row["receipt_quantity"] in {None, 1}
+        ]
+        if not items:
+            continue
+        name = first["proof_file_path"]
+        photo = _fetch(f"{OPEN_PRICES}/{name}", cache / "openprices" / "img" / name)
+        yield Sample(
+            id=f"openprices-{split.lower()}-{proof}",
+            image=photo.read_bytes(),
+            truth=Truth(
+                items=items,
+                total=_cents(first["proof_receipt_price_total"]),
+                date=str(first["proof_date"]) if first["proof_date"] else None,
+                partial=True,
+            ),
+        )
+
+
+DATASETS: dict[str, Callable[[Path, str], Iterator[Sample]]] = {
+    "cord": cord,
+    "openprices": openprices,
+    "synthetic": synthetic,
+}

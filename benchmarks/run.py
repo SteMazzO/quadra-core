@@ -1,7 +1,8 @@
 """Score quadra-core on a public receipt dataset.
 
     uv run --group bench python benchmarks/run.py cord --split validation
-    uv run --group bench python benchmarks/run.py cord --failures out/
+    uv run --group bench python benchmarks/run.py synthetic --split IT
+    uv run --group bench python benchmarks/run.py openprices --split IT --engine photo
 
 `--engine truth` feeds the dataset's own transcription to the parser, which
 scores the parsing alone. Any other engine reads the photos.
@@ -64,7 +65,7 @@ def main() -> None:
     """Run the benchmark and print its summary as JSON."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("dataset", choices=sorted(DATASETS))
-    ap.add_argument("--split", default="validation")
+    ap.add_argument("--split", default="validation", help="or a country: IT, DE...")
     ap.add_argument("--engine", default="truth")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--cache", type=Path, default=Path.home() / ".cache/quadra-bench")

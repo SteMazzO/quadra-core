@@ -102,6 +102,14 @@ Money is always in integer minor units (cents, or whole units where `decimal_pla
 
 The two validation receipts called `ok` but scored wrong are annotation slips in the dataset. Reading photos end to end adds the OCR engine's own errors on top; those numbers are not measured yet.
 
+Two more sets cover Italy:
+
+    uv run --group bench python benchmarks/run.py synthetic --split IT
+    uv run --group bench python benchmarks/run.py openprices --split IT --engine photo
+
+- `synthetic` is rendered receipts with exact labels (also `DE`, `FR`, `UK`, `US`). On its 155 Italian receipts 98% come out with every amount right. They are generated from a few templates, so this catches regressions; it says little about real paper.
+- `openprices` is 383 real photos from Italian chains (Poli, MD, Esselunga, Lidl, Conad, Coop and more), where volunteers typed in a few of each receipt's prices. No public set of real Italian receipts has every line annotated, so this scores whether those known prices are found.
+
 `benchmarks/show.py` prints what the parser saw on any receipt it got wrong. Datasets are downloaded from their own homes into `~/.cache/quadra-bench`.
 
 ## Development

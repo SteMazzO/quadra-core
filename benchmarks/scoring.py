@@ -36,6 +36,8 @@ class Truth:
     tax: int | None = None
     merchant: str | None = None
     date: str | None = None  # ISO, YYYY-MM-DD
+    # The items are only some of those printed: finding them is all that is scored.
+    partial: bool = False
 
 
 @dataclass(slots=True)
@@ -91,13 +93,20 @@ class Outcome:
     exact: bool = False
 
 
-def _match(truth: list[Item], predicted: list[dict[str, Any]]) -> list[tuple[int, int]]:
-    """Pair true and predicted items with equal line totals, likeliest names first."""
+def _match(
+    truth: list[Item], predicted: list[dict[str, Any]], unit: bool = False
+) -> list[tuple[int, int]]:
+    """Pair true and predicted items with equal line totals, likeliest names first.
+
+    With `unit`, the true figure may also be the unit price: volunteers typing in
+    a receipt record either.
+    """
     pairs = sorted(
         (-similarity(item.name, guess["description"]), t, p)
         for t, item in enumerate(truth)
         for p, guess in enumerate(predicted)
-        if abs(guess["line_total_minor"]) == item.total
+        if item.total == abs(guess["line_total_minor"])
+        or (unit and item.total == guess["unit_price_minor"])
     )
     used_true: set[int] = set()
     used_predicted: set[int] = set()
@@ -134,7 +143,7 @@ def score(sample: Sample, document: dict[str, Any]) -> Outcome:
         # A line priced at nothing changes no sum, so it is not scored either way.
         predicted = [i for i in document["line_items"] if i["line_total_minor"]]
         truth.items = [i for i in truth.items if i.total]
-        pairs = _match(truth.items, predicted)
+        pairs = _match(truth.items, predicted, unit=truth.partial)
         outcome.items_true = len(truth.items)
         outcome.items_predicted = len(predicted)
         outcome.priced = len(pairs)
@@ -144,7 +153,11 @@ def score(sample: Sample, document: dict[str, Any]) -> Outcome:
             if item.quantity is not None:
                 outcome.quantities_true += 1
                 outcome.quantities_right += Decimal(guess["quantity"]) == item.quantity
-        items_right = len(pairs) == len(truth.items) == len(predicted)
+        if truth.partial:
+            outcome.items_predicted = len(pairs)
+        items_right = len(pairs) == len(truth.items) and (
+            truth.partial or len(pairs) == len(predicted)
+        )
 
     outcome.exact = items_right and outcome.fields.get("total", True)
     return outcome
