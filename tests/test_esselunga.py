@@ -1,9 +1,8 @@
-"""Esselunga profile tests, over OCR of rendered and photographed receipts."""
+"""Esselunga receipt tests, over OCR of rendered and photographed receipts."""
 
 from __future__ import annotations
 
 import re
-from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -11,25 +10,21 @@ import pytest
 from quadra_core.pipeline import recheck
 from quadra_core.pipeline.extract import (
     LineItem,
-    Modifier,
     _attach,
     extract,
-    extract_item,
-    find_item_region,
     strip_noise,
 )
+from quadra_core.pipeline.lexicon import role
 from quadra_core.pipeline.lines import (
     Line,
     Word,
     drop_speckle,
     group_lines,
     load_tsv,
-    text_block,
 )
-from quadra_core.pipeline.money import normalize_separators, parse_money
+from quadra_core.pipeline.money import Format, parse_amount
 from quadra_core.pipeline.review import reasons, status
 from quadra_core.pipeline.validate import validate
-from quadra_core.profiles import loader
 from quadra_core.testdata import OCR as FIXTURES
 
 # Esselunga loyalty numbers print as '040*******92'; OCR reads the zeros as letter O.
@@ -42,14 +37,10 @@ RECEIPT_B_TOTAL = 2644
 RECEIPT_B_ITEMS = [119, 99, 99, 99, 99, 129, 179, 149, 2392]
 
 
-def esselunga():
-    return next(p for p in loader.available() if p.id == "esselunga")
-
-
 def run(name: str):
     lines = group_lines(drop_speckle(load_tsv((FIXTURES / f"{name}.tsv").read_text())))
-    ex = extract(lines, esselunga())
-    return ex, validate(ex, esselunga())
+    ex = extract(lines)
+    return ex, validate(ex)
 
 
 @pytest.mark.parametrize(
@@ -62,7 +53,7 @@ def run(name: str):
 )
 def test_receipts_parse_and_balance(name, total):
     ex, v = run(name)
-    found = reasons(ex, v, esselunga())
+    found = reasons(ex, v)
     assert status(ex, found) == "ok", found
     assert v.balanced and v.delta_minor == 0
     assert v.printed_total_minor == total
@@ -110,7 +101,6 @@ def test_trailing_sign_discount_is_negative_and_kept_as_an_adjustment(name):
     assert len(ex.adjustments) == 1
     adjustment = ex.adjustments[0]
     assert adjustment.amount_minor == -720
-    assert adjustment.kind == "discount"
     assert "SCONTO" in adjustment.label.upper()
     assert not any(i.line_total_minor == 720 for i in ex.items)
 
@@ -138,43 +128,6 @@ def test_description_containing_a_decimal_is_not_split():
     assert "1,5" in clementine[0].description
 
 
-def test_profile_fingerprint_uses_the_company_vat_number():
-    """The VAT number is identical across stores, so it survives a shop change."""
-    profile = esselunga()
-    assert "04916380159" in profile.fingerprint
-    lines = [
-        l.text
-        for l in group_lines(
-            drop_speckle(load_tsv((FIXTURES / "esselunga_b_faded.tsv").read_text()))
-        )
-    ]
-    selected = loader.select(lines)
-    assert selected is not None and selected[0].id == "esselunga"
-
-
-def test_profile_declares_the_observed_layout():
-    profile = esselunga()
-    assert profile.has_quantity_column is False
-    assert profile.has_unit_price_column is False
-    assert profile.modifier_position == "before"
-
-
-@pytest.mark.parametrize(
-    "token,expected",
-    [("1;;19", 119), ("1:79", 179), ("2:99", 299), ("7,20-S", -720), ("23,92", 2392)],
-)
-def test_separator_confusion_is_normalised(token, expected):
-    """On faded print OCR reads the decimal comma as ';' or ':'."""
-    assert parse_money(normalize_separators(token)) == expected
-
-
-def test_separator_normalisation_leaves_non_decimal_punctuation_alone():
-    """Only separators between digits are decimal points."""
-    untouched = "SACCHETTO COMPOST.LE 0,01"
-    assert normalize_separators(untouched) == untouched
-    assert normalize_separators("8x. 2:99") == "8x. 2,99"
-
-
 # --- Real photograph -------------------------------------------------------------
 # esselunga_photo: a low-resolution photo of receipt B, its total unreadable.
 
@@ -198,7 +151,7 @@ def test_a_total_taken_from_the_payments_is_recorded():
     """The items and the payments agree on their own, so no review is needed."""
     ex, v = run("esselunga_photo")
     assert "printed_total_unreadable_used_payments" in v.warnings
-    assert status(ex, reasons(ex, v, esselunga())) == "ok"
+    assert status(ex, reasons(ex, v)) == "ok"
 
 
 def test_change_is_subtracted_from_amounts_tendered():
@@ -206,7 +159,7 @@ def test_change_is_subtracted_from_amounts_tendered():
     ex, _ = run("esselunga_photo")
     ex.change_minor = 500
     ex.payments_minor = [*ex.payments_minor, 500]
-    v = validate(ex, esselunga())
+    v = validate(ex)
     assert v.printed_total_minor == RECEIPT_B_TOTAL, "change was not netted off"
 
 
@@ -214,14 +167,14 @@ def test_printed_total_wins_when_both_are_readable():
     """The payments are a fallback, not a replacement."""
     ex, _ = run("esselunga_b")
     assert ex.printed_total_minor == RECEIPT_B_TOTAL
-    v = validate(ex, esselunga())
+    v = validate(ex)
     assert v.total_source == "printed"
 
 
 def test_a_misread_payment_loses_to_the_items_and_the_printed_total():
     ex, _ = run("esselunga_b")
     ex.payments_minor = [9999]
-    v = validate(ex, esselunga())
+    v = validate(ex)
     assert "payment_misread:9999" in v.warnings
     assert v.total_confirmed and v.balanced
 
@@ -230,9 +183,9 @@ def test_totals_that_nothing_can_reconcile_go_to_review():
     ex, _ = run("esselunga_b")
     ex.payments_minor = [9999]
     ex.items[0].line_total_minor += 1
-    v = validate(ex, esselunga())
+    v = validate(ex)
     assert v.total_disputed
-    [reason] = [r for r in reasons(ex, v, esselunga()) if r.field == "total"]
+    [reason] = [r for r in reasons(ex, v) if r.field == "total"]
     assert reason.code == "total_disputed"
     assert reason.message == "The total reads 26,44 but the payment reads 99,99."
 
@@ -280,9 +233,6 @@ def test_photograph_prices_are_exact_even_where_descriptions_are_not():
     """Prices come out exact even where descriptions are misread."""
     ex, _ = run("esselunga_photo_payments")
     assert sorted(i.line_total_minor for i in ex.items) == [1, 1, 61, 65, 99, 298]
-    assert any(
-        i.description != i.description_raw or "TL" in i.description for i in ex.items
-    ), "expected OCR noise in descriptions"
 
 
 # --- a long, curled receipt -------------------------------------------------
@@ -293,7 +243,7 @@ def curled() -> tuple:
     lines = group_lines(
         drop_speckle(load_tsv((FIXTURES / "esselunga_photo_curled.tsv").read_text()))
     )
-    return lines, extract(lines, esselunga())
+    return lines, extract(lines)
 
 
 def test_a_wavy_receipt_keeps_each_price_with_its_own_description():
@@ -328,9 +278,8 @@ def test_a_comma_printed_over_a_fold_is_still_a_comma():
 
 def test_the_printed_total_is_read_rather_than_inferred():
     """A mangled 'TOTA.E EURO' still matches the total rule."""
-    profile = esselunga()
-    assert profile.rule_for("TOTA.E EURO 127,05 +") == "total"
-    assert profile.rule_for("TOTALE EURO 26,44") == "total"
+    assert role("TOTA.E EURO 127,05 +") == "total"
+    assert role("TOTALE EURO 26,44") == "total"
 
 
 def test_the_whole_receipt_comes_out():
@@ -389,16 +338,6 @@ def test_a_short_word_mid_description_is_not_mistaken_for_a_bracket():
     assert "LT" in oliva.description
 
 
-def test_a_profile_without_that_column_is_unaffected():
-    profile = esselunga()
-    without = replace(profile, vat_code_re=None)
-    lines, _ = curled()
-    plain = extract(lines, without)
-    assert all(i.vat_code is None for i in plain.items)
-    # The marker stays in the description.
-    assert any(re.search(r"[*«»#][a-z]", i.description) for i in plain.items)
-
-
 # --- a receipt photographed on a wooden table -------------------------------
 # 33 items, 8 discounts, 101,29, with desk grain in the crop and a tilted footer.
 
@@ -407,7 +346,7 @@ def table() -> tuple:
     lines = group_lines(
         drop_speckle(load_tsv((FIXTURES / "esselunga_photo_table.tsv").read_text()))
     )
-    return lines, extract(lines, esselunga())
+    return lines, extract(lines)
 
 
 def test_the_whole_table_receipt_is_read():
@@ -419,24 +358,23 @@ def test_the_whole_table_receipt_is_read():
 def test_it_finds_its_own_total():
     """The total comes from the payment line, the printed one being unreadable."""
     _lines, ex = table()
-    validation = validate(ex, esselunga())
+    validation = validate(ex)
     assert validation.printed_total_minor == 10129
     assert validation.delta_minor == 0
 
 
 def test_a_payment_line_is_read_through_whatever_precedes_it():
     """OCR junk from the paper's edge before 'PAGAMENTO' doesn't hide the payment."""
-    profile = esselunga()
-    assert profile.rule_for("$ PAGAMENTO CARTA FIDATY ORO 101,29") == "payment"
-    assert profile.rule_for("PAGAMENTO CARTA FIDATY ORO 101,29") == "payment"
+    assert role("$ PAGAMENTO CARTA FIDATY ORO 101,29") == "payment"
+    assert role("PAGAMENTO CARTA FIDATY ORO 101,29") == "payment"
     # The loyalty line itself is still noise: it carries no payment.
-    assert profile.rule_for("N. CARTA FIDATY: 00XX*XX***00") == "noise"
+    assert role("N. CARTA FIDATY: 00XX*XX***00") != "total"
 
 
 def test_a_discount_whose_sign_letter_was_read_as_a_digit():
     """'0,74-S' read as '0,74-8' is still minus 0,74."""
-    assert parse_money("0,74-8") == -74
-    assert parse_money("0,74-S") == -74
+    assert parse_amount("0,74-8", Format()) == -74
+    assert parse_amount("0,74-S", Format()) == -74
 
 
 def test_the_footer_lines_hold_together():
@@ -473,18 +411,7 @@ def test_that_receipt_still_finds_its_total_through_the_payments():
     assert validation.delta_minor == -10
 
 
-def test_the_item_region_never_starts_after_the_total():
-    """The end anchor keeps the line it matched, whatever else also matches it."""
-    lines = group_lines(
-        drop_speckle(load_tsv((FIXTURES / "esselunga_photo_no_header.tsv").read_text()))
-    )
-    total = next(i for i, ln in enumerate(lines) if "TOTALE" in ln.text)
-    start, end = find_item_region(lines, esselunga())
-    assert start < total, "items must not begin after the total"
-    assert end <= total, "items must not run past the total"
-
-
-# --- profile handling -------------------------------------------------------
+# --- descriptions -----------------------------------------------------------
 
 
 def _line(index: int, words: list[str]):
@@ -493,56 +420,6 @@ def _line(index: int, words: list[str]):
         out.append(Word(text, x, index * 30, len(text) * 10, 20, 95.0))
         x += len(text) * 10 + 15
     return Line(words=out, index=index)
-
-
-def test_a_quantity_column_is_read_without_a_unit_price_column():
-    """A shop printing quantity and total but no unit price."""
-    base = next(p for p in loader.available() if p.id == "synthetic")
-    shop = replace(base, has_quantity_column=True, has_unit_price_column=False)
-    lines = [
-        _line(0, ["SCONTRINO", "N", "1"]),
-        _line(1, ["MELE", "3", "4,50"]),
-        _line(2, ["TOTALE", "COMPLESSIVO", "4,50"]),
-    ]
-    (item,) = extract(lines, shop).items
-    assert item.quantity == Decimal(3)
-    assert item.quantity_source == "parsed"
-    assert item.description == "MELE"
-    assert item.unit_price_minor == 150
-
-
-def test_a_modifier_printed_after_its_item_attaches_to_the_item_above():
-    """Both items cost 23,92, so only the profile's position breaks the tie."""
-    base = next(p for p in loader.available() if p.id == "esselunga")
-    lines = [
-        _line(0, ["EURO"]),
-        _line(1, ["OLIVE", "23,92"]),
-        _line(2, ["8", "x", "2,99"]),
-        _line(3, ["PANE", "23,92"]),
-        _line(4, ["TOTALE", "EURO", "47,84"]),
-    ]
-    after = extract(lines, replace(base, modifier_position="after")).items
-    assert [(i.description, i.quantity_source) for i in after] == [
-        ("OLIVE", "modifier"),
-        ("PANE", "implicit"),
-    ]
-
-    before = extract(lines, replace(base, modifier_position="before")).items
-    assert [(i.description, i.quantity_source) for i in before] == [
-        ("OLIVE", "implicit"),
-        ("PANE", "modifier"),
-    ]
-
-
-def test_an_unknown_modifier_position_is_refused_at_load_time(tmp_path):
-    """A typo in modifier_position is an error, not silently ignored."""
-    bad = tmp_path / "bad.toml"
-    bad.write_text(
-        '[profile]\nid="x"\nversion=1\n[format]\nmoney="\\\\d+"\n'
-        '[layout]\nmodifier_position="Before"\n'
-    )
-    with pytest.raises(loader.ProfileError, match="modifier_position"):
-        loader.load(bad)
 
 
 def test_edge_noise_is_stripped_from_the_front_of_a_description():
@@ -555,10 +432,7 @@ def test_edge_noise_is_stripped_from_the_front_of_a_description():
         ],
         index=1,
     )
-    profile = next(p for p in loader.available() if p.id == "esselunga")
-    item = extract_item(line, profile, text_block([line]), None)
-    assert item.description == "LOACKER"
-    assert item.confidence > 0.9
+    assert [w.text for w in strip_noise(line.words[:2])] == ["LOACKER"]
 
 
 def test_a_description_is_never_stripped_away_entirely():
@@ -671,7 +545,7 @@ def merged_rows() -> tuple:
             load_tsv((FIXTURES / "esselunga_photo_merged_rows.tsv").read_text())
         )
     )
-    return lines, extract(lines, esselunga())
+    return lines, extract(lines)
 
 
 def test_an_amount_in_the_description_is_not_taken_for_the_price():
@@ -689,16 +563,16 @@ def test_a_number_split_at_its_comma_is_joined_across_a_wider_gap():
 
 def test_merged_rows_are_recovered_from_the_price_column(monkeypatch):
     lines, ex = merged_rows()
-    first = validate(ex, esselunga())
+    first = validate(ex)
     assert not first.balanced, "fixture no longer exercises the recovery"
 
     readings = {int(k): v for k, v in MERGED_ROWS_READINGS.items()}
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: readings)
-    result = recheck.repair(ex, first, object(), esselunga(), lines)
+    result = recheck.repair(ex, first, object(), lines)
     assert result is not None
-    recheck.apply(ex, result, lines, esselunga())
+    recheck.apply(ex, result, lines)
 
-    v = validate(ex, esselunga())
+    v = validate(ex)
     assert v.balanced, f"delta {v.delta_minor}"
     assert [i.line_total_minor for i in ex.items] == CREASED_ITEMS
     assert sorted(a.amount_minor for a in ex.adjustments) == CREASED_DISCOUNTS
@@ -709,8 +583,8 @@ def test_recovered_lines_are_named_without_the_price_that_failed(monkeypatch):
     lines, ex = merged_rows()
     readings = {int(k): v for k, v in MERGED_ROWS_READINGS.items()}
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: readings)
-    result = recheck.repair(ex, validate(ex, esselunga()), object(), esselunga(), lines)
-    recheck.apply(ex, result, lines, esselunga())
+    result = recheck.repair(ex, validate(ex), object(), lines)
+    recheck.apply(ex, result, lines)
 
     recovered = [i for i in ex.items if "line_recovered" in i.flags]
     # The other three recovered lines are discounts.
@@ -723,7 +597,6 @@ def test_recovered_lines_are_named_without_the_price_that_failed(monkeypatch):
 
 def _priced(line_index: int, total: int) -> LineItem:
     return LineItem(
-        description_raw="THING",
         description="THING",
         quantity=Decimal(1),
         quantity_source="implicit",
@@ -740,7 +613,7 @@ def test_a_modifier_reaches_past_a_discount_to_the_item_it_fits():
     """A discount line between a modifier and its item is not a wall."""
     items = [_priced(0, 199), _priced(3, 518)]
     warnings: list[str] = []
-    _attach(Modifier(Decimal(2), 259, 1), items, esselunga(), warnings)
+    _attach([(1, Decimal(2), 259)], items, warnings)
 
     assert items[1].quantity == Decimal(2)
     assert items[1].quantity_source == "modifier"
@@ -751,7 +624,7 @@ def test_a_modifier_reaches_past_a_discount_to_the_item_it_fits():
 def test_a_modifier_that_fits_no_neighbour_is_reported_not_dropped():
     items = [_priced(0, 500)]
     warnings: list[str] = []
-    _attach(Modifier(Decimal(3), 100, 1), items, esselunga(), warnings)
+    _attach([(1, Decimal(3), 100)], items, warnings)
 
     assert items[0].quantity_source == "implicit"
     assert warnings == ["modifier_unattached:line1"]

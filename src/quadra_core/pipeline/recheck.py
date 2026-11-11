@@ -24,6 +24,7 @@ from quadra_core.pipeline.extract import (
     read_vat_code,
     strip_noise,
 )
+from quadra_core.pipeline.lexicon import role
 from quadra_core.pipeline.lines import (
     Block,
     Line,
@@ -35,9 +36,9 @@ from quadra_core.pipeline.lines import (
     median_glyph_height,
     text_block,
 )
+from quadra_core.pipeline.money import Format
 
 if TYPE_CHECKING:  # pragma: no cover
-    from ..profiles.loader import Profile
     from .validate import Validation
 
 # (scale, psm) per reading. Each misreads different prices, so they vote.
@@ -70,24 +71,24 @@ _ODD_SEPARATOR = re.compile(r"(?<=\d)\D(?=\d{2}$)")  # '1}20' for '1,20'
 _NO_SEPARATOR = re.compile(r"\d{3}")  # '449' for '4,49'
 
 
-def read_cell(text: str, profile: Profile) -> int | None:
+def read_cell(text: str, fmt: Format) -> int | None:
     """Read one row of the price column, allowing for how thermal print misreads.
 
     Only used for the column re-read: every row there is a price, and the total
     decides between readings, so a wrong guess here is outvoted, not trusted.
     """
-    amount = parse_amount(text, profile)
-    if amount is not None or profile.decimal_places != 2:
+    amount = parse_amount(text, fmt)
+    if amount is not None or fmt.places != 2:
         return amount
 
     negative = bool(_SIGN_LIKE.search(text))
     core = _SIGN_LIKE.sub("", text).strip()
     core = _LOST_LEADING_ONE.sub("1", core, count=1)
-    core = _ODD_SEPARATOR.sub(profile.decimal_separator, core, count=1)
+    core = _ODD_SEPARATOR.sub(fmt.separator, core, count=1)
     core = core.lstrip(".,;:'\u2018\u2019")
     if _NO_SEPARATOR.fullmatch(core):
-        core = f"{core[0]}{profile.decimal_separator}{core[1:]}"
-    amount = parse_amount(core, profile)
+        core = f"{core[0]}{fmt.separator}{core[1:]}"
+    amount = parse_amount(core, fmt)
     if amount is None:
         return None
     return -abs(amount) if negative else amount
@@ -188,9 +189,7 @@ def _assign(
     return {index: text for index, (_distance, text) in best.items()}
 
 
-def second_opinion(
-    prepared: Any, column: Column, profile: Profile
-) -> dict[int, list[int]]:
+def second_opinion(prepared: Any, column: Column, fmt: Format) -> dict[int, list[int]]:
     """Read the price column on its own, several ways: line index -> amounts."""
     if not column.prices:
         return {}
@@ -205,7 +204,7 @@ def second_opinion(
     for scale, psm in READINGS:
         rows = _column_rows(prepared, left, right, scale, psm)
         for index, text in _assign(rows, positions, column.glyph).items():
-            amount = read_cell(text, profile)
+            amount = read_cell(text, fmt)
             if amount is not None:
                 out.setdefault(index, []).append(amount)
     return out
@@ -214,20 +213,18 @@ def second_opinion(
 def _item_votes(item: LineItem, readings: list[int]) -> Counter[int]:
     """Return what this item's price might be: the first pass, plus each reading."""
     votes = Counter(readings)
-    votes[item.line_total_minor or 0] += 1
+    votes[item.line_total_minor] += 1
     if not _NAMED.search(item.description):
         # Maybe a neighbour's price on a row of its own, so allow dropping it.
         votes.setdefault(0, 0)
     return votes
 
 
-def _dropped_votes(
-    line: Line | None, readings: list[int], profile: Profile
-) -> Counter[int]:
+def _dropped_votes(line: Line | None, readings: list[int]) -> Counter[int]:
     """Return what a dropped line might hold: nothing, or what the column read."""
     # A discount by its label, or by a minus sign in any reading.
     discount = any(amount < 0 for amount in readings) or (
-        line is not None and profile.rule_for(line.text) == "discount"
+        line is not None and role(line.text) == "discount"
     )
     votes = Counter(
         -abs(amount) if discount else amount
@@ -293,10 +290,7 @@ def _choose(slots: list[Counter[int]], target: int) -> list[int] | None:
 
 
 def _slots(
-    extraction: Extraction,
-    readings: dict[int, list[int]],
-    lines: list[Line],
-    profile: Profile,
+    extraction: Extraction, readings: dict[int, list[int]], lines: list[Line]
 ) -> list[tuple[int, Counter[int]]]:
     """One slot of candidate amounts per item, and per line that lost its price."""
     by_index = {line.index: line for line in lines}
@@ -305,7 +299,7 @@ def _slots(
         for item in extraction.items
     ]
     for index in extraction.skipped_lines:
-        votes = _dropped_votes(by_index.get(index), readings.get(index, []), profile)
+        votes = _dropped_votes(by_index.get(index), readings.get(index, []))
         if votes:
             slots.append((index, votes))
     return slots
@@ -315,7 +309,6 @@ def repair(
     extraction: Extraction,
     validation: Validation,
     prepared: Any,
-    profile: Profile,
     lines: list[Line],
 ) -> Repair | None:
     """Reconcile the readings with the printed total, or None if unsure."""
@@ -328,11 +321,11 @@ def repair(
         return None
 
     column = survey(lines, extraction)
-    readings = second_opinion(prepared, column, profile)
+    readings = second_opinion(prepared, column, extraction.fmt)
     if not readings:
         return None
 
-    slots = _slots(extraction, readings, lines, profile)
+    slots = _slots(extraction, readings, lines)
     disputed = [(index, votes) for index, votes in slots if len(votes) > 1]
     if not disputed or len(disputed) > MAX_DISPUTED:
         return None
@@ -385,7 +378,6 @@ def _unanimous(votes: Counter[int], amount: int, has_first_reading: bool) -> boo
 def _describing_words(
     line: Line,
     column_left: int | None,
-    profile: Profile,
     block: Block,
     vat_column: float | None,
 ) -> tuple[list[Word], str | None]:
@@ -397,12 +389,12 @@ def _describing_words(
         named = name_words(words, block, vat_column) or strip_noise(words)
         for word in words:
             if word not in named:
-                vat_code = read_vat_code(word.text, profile)
+                vat_code = read_vat_code(word.text)
                 if vat_code is not None:
                     return named, vat_code
         return named, None
     if len(words) > 1:
-        vat_code = read_vat_code(words[-1].text, profile)
+        vat_code = read_vat_code(words[-1].text)
         if vat_code is not None:
             return strip_noise(words[:-1]), vat_code
     return strip_noise(words), None
@@ -414,7 +406,6 @@ def _recovered_item(
     """Build the item for a line the first pass dropped."""
     text = " ".join(w.text for w in words).strip()
     return LineItem(
-        description_raw=text,
         description=" ".join(text.split()),
         quantity=Decimal(1),
         quantity_source="implicit",
@@ -428,9 +419,7 @@ def _recovered_item(
     )
 
 
-def _recover(
-    extraction: Extraction, result: Repair, lines: list[Line], profile: Profile
-) -> None:
+def _recover(extraction: Extraction, result: Repair, lines: list[Line]) -> None:
     """Add back the lines the first pass dropped, as items or as discounts."""
     by_index = {line.index: line for line in lines}
     block = text_block(lines)
@@ -439,13 +428,12 @@ def _recover(
         if line is None:
             continue
         words, vat_code = _describing_words(
-            line, result.column_left, profile, block, extraction.vat_column
+            line, result.column_left, block, extraction.vat_column
         )
         if amount < 0:
             label = " ".join(" ".join(w.text for w in words).split())
             extraction.adjustments.append(
                 Adjustment(
-                    "discount",
                     label,
                     amount,
                     line_index,
@@ -462,16 +450,14 @@ def _recover(
     ]
 
 
-def apply(
-    extraction: Extraction, result: Repair, lines: list[Line], profile: Profile
-) -> None:
+def apply(extraction: Extraction, result: Repair, lines: list[Line]) -> None:
     """Write the agreed prices back, and flag everything that moved.
 
     A change that is not certain carries `price_unconfirmed`, which sends the line
     to review with the arithmetic's answer as a suggestion.
     """
     if result.recovered:
-        _recover(extraction, result, lines, profile)
+        _recover(extraction, result, lines)
         for item in extraction.items:
             if item.line_index in result.recovered and (
                 item.line_index not in result.certain

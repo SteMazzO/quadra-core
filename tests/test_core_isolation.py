@@ -25,7 +25,7 @@ def test_tsv_parses_without_pillow(no_pillow):
     # Imported inside the guard so the import itself is what gets checked.
     from quadra_core import parse_tsv  # noqa: PLC0415
 
-    result = parse_tsv((FIXTURES / "esselunga_b.tsv").read_text(), profile="esselunga")
+    result = parse_tsv((FIXTURES / "esselunga_b.tsv").read_text())
     doc = result.document
     assert result.status == "ok"
     assert len(doc["line_items"]) == 9

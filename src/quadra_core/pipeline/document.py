@@ -10,9 +10,8 @@ from quadra_core.pipeline.extract import Extraction
 from quadra_core.pipeline.lines import Line
 from quadra_core.pipeline.review import item_for, reasons, status
 from quadra_core.pipeline.validate import Validation
-from quadra_core.profiles.loader import Profile
 
-SCHEMA_VERSION = "2.0.0"
+SCHEMA_VERSION = "3.0.0"
 
 
 def _quantity(value: Decimal | None) -> str | None:
@@ -25,11 +24,10 @@ def build(
     lines: list[Line],
     extraction: Extraction,
     validation: Validation,
-    profile: Profile,
     ocr_meta: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble the full receipt document."""
-    found = reasons(extraction, validation, profile, lines)
+    found = reasons(extraction, validation, lines)
     doubtful = {r.item for r in found if r.item is not None}
 
     applies_to = [item_for(a.line_index, extraction) for a in extraction.adjustments]
@@ -43,8 +41,7 @@ def build(
         "schema_version": SCHEMA_VERSION,
         "status": status(extraction, found),
         "review": [asdict(r) for r in found],
-        "profile": {"id": profile.id, "version": profile.version},
-        "currency": profile.currency,
+        "decimal_places": extraction.fmt.places,
         "line_items": [
             {
                 "index": i,
@@ -64,7 +61,6 @@ def build(
         ],
         "adjustments": [
             {
-                "kind": adjustment.kind,
                 "label": adjustment.label,
                 "amount_minor": adjustment.amount_minor,
                 "applies_to": index,
@@ -75,9 +71,25 @@ def build(
                 extraction.adjustments, applies_to, strict=True
             )
         ],
+        "charges": [
+            {
+                "kind": charge.kind,
+                "label": charge.label,
+                "amount_minor": charge.amount_minor,
+                "applied": charge.applied,
+                "line_index": charge.line_index,
+            }
+            for charge in extraction.charges
+        ],
         "totals": {
             "items_subtotal_minor": validation.items_subtotal_minor,
             "discounts_minor": sum(a.amount_minor for a in extraction.adjustments),
+            "subtotal_minor": extraction.subtotal_minor,
+            "tax_minor": sum(
+                c.amount_minor for c in extraction.charges if c.kind == "tax"
+            )
+            or extraction.tax_breakdown_minor
+            or None,
             "computed_total_minor": validation.computed_total_minor,
             "total_minor": validation.printed_total_minor,
             "total_source": validation.total_source,

@@ -1,11 +1,16 @@
-"""Turn lines of words into receipt items, by column position rather than spacing."""
+"""Turn lines of words into receipt items and footer amounts.
+
+Nothing here knows a shop. Prices are found by their column, quantities by
+arithmetic, and the footer by the words every receipt uses for its totals.
+"""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 
+from quadra_core.pipeline.lexicon import is_heading, role
 from quadra_core.pipeline.lines import (
     Block,
     Line,
@@ -15,26 +20,24 @@ from quadra_core.pipeline.lines import (
     text_block,
 )
 from quadra_core.pipeline.money import (
-    TRAILING_SIGN,
-    normalize_separators,
-    parse_money,
+    CURRENCY,
+    Format,
+    detect_format,
+    parse_amount,
     parse_quantity,
-    reconstruct_quantity,
-    strip_sign,
+    times,
 )
-from quadra_core.profiles.loader import Profile, fuzzy_contains
 
 
 @dataclass(slots=True)
 class LineItem:
     """One product line off the receipt."""
 
-    description_raw: str
     description: str
-    quantity: Decimal | None
+    quantity: Decimal
     quantity_source: str  # "parsed" | "reconstructed" | "modifier" | "implicit"
     unit_price_minor: int | None
-    line_total_minor: int | None
+    line_total_minor: int
     vat_code: str | None
     confidence: float
     line_index: int
@@ -42,16 +45,14 @@ class LineItem:
     flags: list[str] = field(default_factory=list)
     # The price the first reading gave, when the re-read replaced it.
     first_read_minor: int | None = None
-
-
-ITEM_CANDIDATE_RULES = frozenset({"item", "unknown", "discount"})
+    # Whether the name was printed on the line beside the price, not on it.
+    borrowed_name: bool = False
 
 
 @dataclass(slots=True)
 class Adjustment:
-    """A discount or similar amount, kept apart from the items."""
+    """A discount printed among the items."""
 
-    kind: str
     label: str
     amount_minor: int
     line_index: int
@@ -60,90 +61,82 @@ class Adjustment:
 
 
 @dataclass(slots=True)
-class Modifier:
-    """A quantity line like '8 x 2,99', matched to its item by arithmetic."""
+class Charge:
+    """An amount printed between the items and the total: tax, service, rounding."""
 
-    quantity: Decimal
-    unit_price_minor: int
+    kind: str  # "tax" | "service" | "discount" | "rounding"
+    label: str
+    amount_minor: int
     line_index: int
-
-    def extends_to(self, line_total_minor: int | None) -> bool:
-        """Whether quantity times unit price equals this line total."""
-        if line_total_minor is None:
-            return False
-        product = (self.quantity * Decimal(self.unit_price_minor)).quantize(
-            Decimal(1), rounding=ROUND_HALF_UP
-        )
-        return abs(int(product) - line_total_minor) <= 1
+    # Whether the total only adds up with this amount counted in. Tax printed on
+    # a receipt whose prices already include it is not.
+    applied: bool = False
 
 
 @dataclass(slots=True)
 class Extraction:
     """Everything pulled off one receipt."""
 
-    items: list[LineItem]
-    adjustments: list[Adjustment]
-    payments_minor: list[int]
-    change_minor: int
-    printed_total_minor: int | None
+    fmt: Format = field(default_factory=Format)
+    items: list[LineItem] = field(default_factory=list)
+    adjustments: list[Adjustment] = field(default_factory=list)
+    charges: list[Charge] = field(default_factory=list)
+    # Tax printed below the total, which is already inside it.
+    tax_breakdown_minor: int = 0
+    subtotal_minor: int | None = None
+    printed_total_minor: int | None = None
     # Set when a person typed the total in; nothing downstream may overrule it.
     printed_total_supplied: bool = False
+    payments_minor: list[int] = field(default_factory=list)
+    change_minor: int = 0
     warnings: list[str] = field(default_factory=list)
     # Lines that looked like products but had no readable price.
     skipped_lines: list[int] = field(default_factory=list)
     # Line index -> price of nameless lines the re-read dropped as a repeated price.
     removed: dict[int, int] = field(default_factory=dict)
-    # Where the VAT brackets sit, as a fraction of the text width, if found.
+    # Where the tax letters sit, as a fraction of the text width, if found.
     vat_column: float | None = None
 
 
-def find_item_region(lines: list[Line], profile: Profile) -> tuple[int, int]:
-    """Return the (start, end) line range between the profile's anchors."""
-    # Find the end first: Esselunga's start anchor 'EURO' also matches 'TOTALE EURO'.
-    end = len(lines)
-    for i, line in enumerate(lines):
-        if any(
-            fuzzy_contains(line.text, a, profile.min_ratio)
-            for a in profile.items_end_before
-        ):
-            end = i
-            break
-
-    start = 0
-    for i in range(end):
-        if any(
-            fuzzy_contains(lines[i].text, a, profile.min_ratio)
-            for a in profile.items_start_after
-        ):
-            start = i + 1
-            break
-
-    if start < end:
-        return (start, end)
-    # The anchors contradict each other: drop the start one, still exclude the footer.
-    return (0, end) if end else (0, len(lines))
-
-
-# OCR often splits a price at the comma ('0,' '48-S'). Join halves closer than this
-# many glyph heights, or the wider ratio when the split is at the separator itself.
+# OCR often splits a price at the separator ('0,' '48-S'). Join halves closer than
+# this many glyph heights, or the wider ratio when the split is at the separator.
 _JOIN_GAP_RATIO = 0.6
 _SEPARATOR_JOIN_GAP_RATIO = 1.0
-_ENDS_IN_SEPARATOR = re.compile(r"\d[,.;:]$")
-_STARTS_WITH_SEPARATOR = re.compile(r"^[,.;:]\d")
+_AT_SEPARATOR = re.compile(r"\d[,.;:]$|^[,.;:]\d")
 
 # How close to the price column an amount must sit: tight first, then loose enough
 # for a curled roll but never far enough to reach the description.
-_COLUMN_MARGIN = 0.03
-_COLUMN_DRIFT = 0.2
+_COLUMN_MARGINS = (0.03, 0.2)
 
 # Creases and shadows come back as punctuation or stray letters around the name.
 _EDGE_NOISE_CONF = 80.0
 _TRAILING_NOISE_CONF = 40.0
 
+# A total is printed taller than the items, even when its label is misread.
 _TALL_LINE_RATIO = 1.9
 
-# How far from the VAT column a word may sit and still be read as the bracket.
+# A tax letter beside the price, such as '*c' or 'B'. OCR mangles the asterisk.
+_VAT_CODE = re.compile(r"\W{0,2}[A-Za-z]?([A-Da-d])\W{0,2}")
+# How far from the tax-letter column a word may sit and still be read as one.
 _VAT_MARGIN = 0.06
+
+# A line that is only a quantity, such as '8 x 2,99' or '0,456 kg x 12,90 EUR/kg'.
+_MODIFIER = re.compile(
+    r"\W*(\d+(?:[.,]\d+)?)\s*[^\W\d_]{0,3}\s*[xX*@]\W*(\S*\d)\W*(?:\s\D{1,6})?"
+)
+
+_CURRENCY_MARK = re.compile(rf"(?:{CURRENCY})\.?:?", re.IGNORECASE)
+
+# The share of item lines that must show a quantity in one place for it to be a column.
+_COLUMN_SHARE = 0.5
+MAX_QUANTITY = 1000
+
+# Footer lines that end the items. Payments only count once one of these is seen,
+# since 'CARTA' and 'BAR' are also things people buy.
+_FOOTER_START = frozenset({"subtotal", "total", "tax"})
+_CHARGES = frozenset({"tax", "service", "discount", "rounding"})
+
+Money = tuple[int, int, int]  # first word, last word, minor units
 
 
 def _is_noise(word: Word) -> bool:
@@ -174,425 +167,425 @@ def strip_noise(words: list[Word]) -> list[Word]:
     return words[first:last] or words
 
 
-def _trim(text: str) -> str:
-    """Drop OCR junk from both ends of a number, keeping its sign."""
-    text = text.strip()
-    sign = ""
-    tail = TRAILING_SIGN.search(text)
-    if tail:
-        sign = tail.group(0)
-        text = text[: tail.start()]
-    lead = "-" if text.startswith("-") else ""
-    core = re.sub(r"^\D+", "", re.sub(r"\D+$", "", text))
-    return f"{lead}{core}{sign}"
-
-
-def parse_amount(text: str, profile: Profile) -> int | None:
-    """Parse one candidate token, or None if it is not money in this profile."""
-    token = normalize_separators(_trim(text), profile.decimal_separator)
-    # Profile money patterns don't include the sign.
-    if not profile.money_re.fullmatch(strip_sign(token)):
-        return None
-    return parse_money(token, places=profile.decimal_places)
-
-
-def _join_ratio(word: Word, nxt: Word) -> float:
-    """How wide a gap may be bridged between these two halves of a number."""
-    at_separator = _ENDS_IN_SEPARATOR.search(
-        word.text
-    ) or _STARTS_WITH_SEPARATOR.search(nxt.text)
-    return _SEPARATOR_JOIN_GAP_RATIO if at_separator else _JOIN_GAP_RATIO
-
-
-def _money_tokens(line: Line, profile: Profile) -> list[tuple[int, int, int]]:
-    """Return (first_word, last_word, cents) for every amount on the line.
-
-    First and last differ when a number was split across two words.
-    """
-    out: list[tuple[int, int, int]] = []
+def money_tokens(line: Line, fmt: Format) -> list[Money]:
+    """Return every amount on the line, joining a number OCR split in two."""
+    out: list[Money] = []
     glyph = median_glyph_height(line.words)
     i = 0
     while i < len(line.words):
         word = line.words[i]
-        minor = parse_amount(word.text, profile)
+        minor = parse_amount(word.text, fmt)
+        if minor is None and i + 1 < len(line.words):
+            nxt = line.words[i + 1]
+            at_separator = _AT_SEPARATOR.search(word.text) or _AT_SEPARATOR.search(
+                nxt.text
+            )
+            reach = _SEPARATOR_JOIN_GAP_RATIO if at_separator else _JOIN_GAP_RATIO
+            if nxt.left - word.right <= glyph * reach and fmt.places:
+                joined = parse_amount(word.text + nxt.text, fmt)
+                if joined is not None:
+                    out.append((i, i + 1, joined))
+                    i += 2
+                    continue
         if minor is not None:
             out.append((i, i, minor))
-            i += 1
-            continue
-
-        nxt = line.words[i + 1] if i + 1 < len(line.words) else None
-        if nxt is not None and nxt.left - word.right <= glyph * _join_ratio(word, nxt):
-            joined = parse_amount(word.text + nxt.text, profile)
-            if joined is not None:
-                out.append((i, i + 1, joined))
-                i += 2
-                continue
         i += 1
     return out
 
 
-def parse_modifier(line: Line, profile: Profile) -> Modifier | None:
-    """Read a 'N x UNIT_PRICE' line, e.g. '8 x 2,99'."""
-    if profile.modifier_re is None:
-        return None
-    match = profile.modifier_re.search(
-        normalize_separators(line.text, profile.decimal_separator)
-    )
-    if not match:
-        return None
-    try:
-        qty = parse_quantity(match.group("qty"), separator=profile.decimal_separator)
-        unit = parse_money(match.group("unit"), places=profile.decimal_places)
-    except (IndexError, KeyError):
-        return None
-    if qty is None or unit is None or unit <= 0:
-        return None
-    return Modifier(qty, unit, line.index)
-
-
-@dataclass(slots=True)
-class _Quantity:
-    """How many, at what unit price, and where that left the description."""
-
-    value: Decimal
-    unit_minor: int | None
-    source: str
-    desc_end: int
-    flags: list[str] = field(default_factory=list)
-
-
-def _resolve_quantity(
-    line: Line,
-    profile: Profile,
-    money: list[tuple[int, int, int]],
-    *,
-    total_idx: int,
-    total_minor: int,
-) -> _Quantity:
-    """Work out the quantity for one line, from whichever source the shop gives."""
-    first_money = min(first for first, _last, _v in money)
-    quantity: Decimal | None = None
-    unit_minor: int | None = None
-    source = "implicit"
-    desc_end = first_money
-    flags: list[str] = []
-
-    # The quantity column sits just left of the first amount.
-    if profile.has_quantity_column and first_money > 0:
-        candidate = parse_quantity(
-            line.words[first_money - 1].text, separator=profile.decimal_separator
-        )
-        if candidate is not None and candidate <= profile.max_quantity:
-            quantity, source, desc_end = candidate, "parsed", first_money - 1
-
-    if profile.has_unit_price_column:
-        earlier = [v for f, _l, v in money if f < total_idx]
-        unit_minor = earlier[-1] if earlier else None
-        derived = reconstruct_quantity(total_minor, unit_minor) if unit_minor else None
-        if derived is not None:
-            if quantity is not None and abs(quantity - derived) > Decimal("0.01"):
-                # Prices survive a bad photo better than the quantity column.
-                flags.append("quantity_disagreement")
-            if quantity is None or flags:
-                quantity, source = derived, "reconstructed"
-    elif quantity is not None:
-        # Derive the unit price, or the per-line check would flag every line.
-        unit_minor = int(
-            (Decimal(total_minor) / quantity).quantize(
-                Decimal(1), rounding=ROUND_HALF_UP
-            )
-        )
-
-    if quantity is None:
-        # Nothing said otherwise: one of whatever it is, at the line total.
-        quantity = Decimal(1)
-        if not profile.has_unit_price_column:
-            unit_minor = total_minor
-
-    return _Quantity(quantity, unit_minor, source, desc_end, flags)
-
-
-def read_vat_code(text: str, profile: Profile) -> str | None:
-    """Return the VAT bracket a word spells, or None if it is not one."""
-    if profile.vat_code_re is None:
-        return None
-    marker = profile.vat_code_re.fullmatch(text)
-    if not marker:
-        return None
-    # With a capture group the code is the group; the rest is the OCR'd asterisk.
-    found = marker.group(1) if marker.groups() else marker.group(0)
-    return found.strip().lower() or None
-
-
-def price_candidates(
-    line: Line,
-    money: list[tuple[int, int, int]],
-    block: Block,
-    price_column: tuple[float, float] | None,
-) -> list[tuple[int, int, int]]:
-    """Return the amounts that can be the line's price: in the column, else near it."""
-    if price_column is None:
-        return money
-    low, high = price_column
-    for margin in (_COLUMN_MARGIN, _COLUMN_DRIFT):
+def price_of(
+    line: Line, money: list[Money], block: Block, column: tuple[float, float] | None
+) -> Money | None:
+    """Return the line's price: its rightmost amount in the price column, or near it."""
+    if column is None:
+        return money[-1] if money else None
+    low, high = column
+    for margin in _COLUMN_MARGINS:
         near = [
-            (first, last, value)
-            for first, last, value in money
-            if low - margin <= block.fraction(line.words[last].right) <= high + margin
+            m
+            for m in money
+            if low - margin <= block.fraction(line.words[m[1]].right) <= high + margin
         ]
         if near:
-            return near
-    return []
+            # A second column of zeros (a discount, a deposit) is not the price.
+            return next((m for m in reversed(near) if m[2]), near[-1])
+    return None
+
+
+def read_vat_code(text: str) -> str | None:
+    """Return the tax letter a word spells, or None if it is not one."""
+    marker = _VAT_CODE.fullmatch(text)
+    return marker.group(1).lower() if marker else None
 
 
 def name_words(words: list[Word], block: Block, vat_column: float | None) -> list[Word]:
-    """Return the words that name a line: left of the VAT column, junk trimmed."""
+    """Return the words that name a line: left of the tax letters, junk trimmed."""
     if vat_column is not None:
         words = [w for w in words if block.fraction(w.cx) < vat_column - _VAT_MARGIN]
     return strip_noise(words) if words else []
 
 
-def find_vat_column(
-    lines: list[Line],
-    profile: Profile,
-    block: Block,
-    price_column: tuple[float, float] | None,
-) -> float | None:
-    """Where the VAT brackets sit, as a fraction of the block width, or None."""
-    if profile.vat_code_re is None:
-        return None
-    spots = []
-    for line in lines:
-        priced = price_candidates(
-            line, _money_tokens(line, profile), block, price_column
-        )
-        if not priced or not priced[-1][0]:
-            continue
-        word = line.words[priced[-1][0] - 1]
-        if read_vat_code(word.text, profile) is not None:
-            spots.append(block.fraction(word.cx))
-    # One bracket-shaped word is not a column.
-    if len(spots) < 2:
-        return None
-    return sorted(spots)[len(spots) // 2]
-
-
-def _split_vat(
-    line: Line,
-    profile: Profile,
-    block: Block,
-    total_idx: int,
-    vat_column: float | None,
-) -> tuple[int, str | None]:
-    """Return where the description ends, and the VAT code if one was read."""
-    if vat_column is None:
-        # No column to go by: the bracket is the word just left of the price.
-        vat_code = (
-            read_vat_code(line.words[total_idx - 1].text, profile)
-            if total_idx
-            else None
-        )
-        return (total_idx - 1 if vat_code else total_idx), vat_code
-
-    # From the VAT column rightwards there is only the bracket and crease noise.
-    desc_end = total_idx
-    for index, word in enumerate(line.words[:total_idx]):
-        if block.fraction(word.cx) >= vat_column - _VAT_MARGIN:
-            desc_end = index
-            break
-    for word in line.words[desc_end:total_idx]:
-        if abs(block.fraction(word.cx) - vat_column) <= _VAT_MARGIN:
-            vat_code = read_vat_code(word.text, profile)
-            if vat_code is not None:
-                return desc_end, vat_code
-    return desc_end, None
-
-
 def description_confidence(words: list[Word]) -> float:
     """How sure the OCR is of a name: the mean over its words, 0 to 1.
 
-    Not the minimum, since Tesseract scores correct abbreviations like 'ESSEL.X6' low.
+    Not the minimum, since OCR scores correct abbreviations like 'ESSEL.X6' low.
     """
     return round(sum(w.conf for w in words) / len(words) / 100, 3)
 
 
-def extract_item(
-    line: Line,
-    profile: Profile,
-    block: Block,
-    price_column: tuple[float, float] | None,
-    *,
-    money: list[tuple[int, int, int]] | None = None,
-    vat_column: float | None = None,
-) -> LineItem | None:
-    """Pull one item out of a line, or None if the line holds no price."""
-    money = _money_tokens(line, profile) if money is None else money
-    priced = price_candidates(line, money, block, price_column)
-    if not priced:
-        return None
+@dataclass(slots=True)
+class _Row:
+    """One line of the item area that carries a price."""
 
-    total_idx, _total_last, total_minor = priced[-1]
-    resolved = _resolve_quantity(
-        line, profile, money, total_idx=total_idx, total_minor=total_minor
+    line: Line
+    money: list[Money]
+    price: Money
+
+
+@dataclass(slots=True)
+class _Layout:
+    """Where this receipt prints quantities and tax letters, judged over its rows."""
+
+    leading_quantity: bool = False
+    trailing_quantity: bool = False
+    vat_column: float | None = None
+
+
+def _leading(row: _Row) -> Decimal | None:
+    """Return the whole number a row starts with, if anything follows it."""
+    words = row.line.words
+    if row.price[0] < 2 or not re.fullmatch(r"[x*]?\d{1,3}[xX*]?", words[0].text):
+        return None
+    return parse_quantity(words[0].text)
+
+
+def _trailing(row: _Row) -> Decimal | None:
+    """Return the whole number printed just left of the price, after the name."""
+    index = row.price[0] - 1
+    if index < 1 or not re.fullmatch(r"[x*]?\d{1,3}[xX*]?", row.line.words[index].text):
+        return None
+    return parse_quantity(row.line.words[index].text)
+
+
+def _layout(rows: list[_Row], block: Block) -> _Layout:
+    if not rows:
+        return _Layout()
+    needed = max(1.0, len(rows) * _COLUMN_SHARE)
+    spots = [
+        block.fraction(word.cx)
+        for row in rows
+        if row.price[0]
+        and read_vat_code((word := row.line.words[row.price[0] - 1]).text) is not None
+    ]
+    return _Layout(
+        leading_quantity=sum(_leading(r) is not None for r in rows) >= needed,
+        trailing_quantity=sum(_trailing(r) is not None for r in rows) >= needed,
+        # One letter-shaped word is not a column.
+        vat_column=sorted(spots)[len(spots) // 2] if len(spots) >= 2 else None,
     )
-    vat_end, vat_code = _split_vat(line, profile, block, total_idx, vat_column)
-    desc_end = min(resolved.desc_end, vat_end)
 
-    desc_words = strip_noise(line.words[:desc_end])
-    description_raw = " ".join(w.text for w in desc_words).strip()
-    if not description_raw:
+
+def _quantity(row: _Row, layout: _Layout) -> tuple[Decimal, int | None, str, set[int]]:
+    """Work out (quantity, unit price, source, words used) for one row.
+
+    A quantity and a unit price printed on the row prove themselves by
+    multiplying to its price. A bare number counts only where the receipt has a
+    quantity column and it divides the price.
+    """
+    words = row.line.words
+    total_index, _last, total = row.price
+    units = [m for m in row.money if m[1] < total_index]
+    for first, last, unit in reversed(units):
+        if unit <= 0:
+            continue
+        for index in range(total_index):
+            quantity = parse_quantity(words[index].text)
+            if (
+                quantity is not None
+                and not first <= index <= last
+                and quantity <= MAX_QUANTITY
+                and abs(times(quantity, unit) - total) <= 1
+            ):
+                return quantity, unit, "parsed", {index, *range(first, last + 1)}
+
+    # A unit price beside the total, its quantity unreadable: divide to get it.
+    if units and units[-1][1] == total_index - 1 and units[-1][2] > 0 and total > 0:
+        first, last, unit = units[-1]
+        quantity = (Decimal(total) / unit).quantize(Decimal("0.001"))
+        if quantity <= MAX_QUANTITY:
+            return quantity, unit, "reconstructed", set(range(first, last + 1))
+
+    for wanted, read, index in (
+        (layout.leading_quantity, _leading, 0),
+        (layout.trailing_quantity, _trailing, total_index - 1),
+    ):
+        quantity = read(row)
+        # '2' is a quantity only in a quantity column; 'x2' says so itself.
+        marked = quantity is not None and not words[index].text.isdigit()
+        if quantity is not None and (wanted or marked) and total % int(quantity) == 0:
+            return quantity, total // int(quantity), "parsed", {index}
+    return Decimal(1), total, "implicit", set()
+
+
+def _vat(row: _Row, block: Block, layout: _Layout) -> tuple[int, str | None]:
+    """Return where the description ends, and the tax letter if one was read."""
+    words, total_index = row.line.words, row.price[0]
+    if layout.vat_column is None:
+        # No column to go by: only a marked letter such as '*a', left of the price.
+        text = words[total_index - 1].text if total_index else ""
+        code = None if text.isalnum() else read_vat_code(text)
+        return (total_index - 1 if code else total_index), code
+    # From the tax-letter column rightwards there is only the letter and crease noise.
+    end = next(
+        (
+            i
+            for i, word in enumerate(words[:total_index])
+            if block.fraction(word.cx) >= layout.vat_column - _VAT_MARGIN
+        ),
+        total_index,
+    )
+    for word in words[end:total_index]:
+        code = read_vat_code(word.text)
+        if code and abs(block.fraction(word.cx) - layout.vat_column) <= _VAT_MARGIN:
+            return end, code
+    return end, None
+
+
+def _item(
+    row: _Row, block: Block, layout: _Layout, beside: Line | None
+) -> LineItem | None:
+    """Build the item for one priced row, named by the line beside it if nameless."""
+    line = row.line
+    quantity, unit, source, used = _quantity(row, layout)
+    end, vat_code = _vat(row, block, layout)
+    named = strip_noise(
+        [
+            w
+            for i, w in enumerate(line.words[:end])
+            # The 'x' and '@' of '2 x @ 12.000' go with the numbers.
+            if i not in used and not (used and w.text in {"x", "X", "@", "*"})
+        ]
+    )
+    borrowed = (
+        not any(c.isalpha() for w in named for c in w.text) and beside is not None
+    )
+    if borrowed:
+        named = strip_noise(beside.words)
+    if not named:
         return None
-
     return LineItem(
-        description_raw=description_raw,
-        description=" ".join(description_raw.split()),
-        quantity=resolved.value,
-        quantity_source=resolved.source,
-        unit_price_minor=resolved.unit_minor,
-        line_total_minor=total_minor,
+        description=" ".join(w.text for w in named),
+        quantity=quantity,
+        quantity_source=source,
+        unit_price_minor=unit,
+        line_total_minor=row.price[2],
         vat_code=vat_code,
-        confidence=description_confidence(desc_words),
+        confidence=description_confidence(named),
         line_index=line.index,
         bbox=(line.left, line.top, line.right - line.left, line.bottom - line.top),
-        flags=resolved.flags,
+        borrowed_name=borrowed,
     )
+
+
+def _modifier(line: Line, fmt: Format) -> tuple[Decimal, int] | None:
+    """Read a quantity line such as '8 x 2,99': (quantity, unit price)."""
+    found = _MODIFIER.fullmatch(line.text)
+    if not found:
+        return None
+    quantity = parse_quantity(found.group(1))
+    unit = parse_amount(found.group(2), fmt)
+    if quantity is None or unit is None or unit <= 0:
+        return None
+    return quantity, unit
 
 
 def _attach(
-    modifier: Modifier, items: list[LineItem], profile: Profile, warnings: list[str]
-) -> None:
-    """Give a modifier's quantity to the neighbouring item its arithmetic fits.
-
-    The profile's position only breaks a tie: on one receipt the same 23,92 sits
-    on both sides of an '8 x 2,99'.
-    """
-    before = [i for i in items if i.line_index < modifier.line_index]
-    after = [i for i in items if i.line_index > modifier.line_index]
-    neighbours = [after[0] if after else None, before[-1] if before else None]
-    if profile.modifier_position == "after":
-        neighbours.reverse()
-
-    for item in neighbours:
-        if item is not None and modifier.extends_to(item.line_total_minor):
-            item.quantity = modifier.quantity
-            item.unit_price_minor = modifier.unit_price_minor
-            item.quantity_source = "modifier"
-            return
-    warnings.append(f"modifier_unattached:line{modifier.line_index}")
-
-
-def _scan_footer(
-    lines: list[Line], profile: Profile
-) -> tuple[int | None, list[int], int]:
-    """Read the printed total, the amounts tendered, and any change given.
-
-    The whole page is scanned: when the printed total is unreadable the item region
-    runs to the last line, and the payments below it would be out of reach.
-    """
-    printed_total: int | None = None
-    payments: list[int] = []
-    change = 0
-
-    for line in lines:
-        rule = profile.rule_for(line.text)
-        if rule not in {"total", "payment", "change"}:
-            continue
-        money = _money_tokens(line, profile)
-        if not money:
-            continue
-        if rule == "total":
-            printed_total = money[-1][2]
-        elif rule == "payment":
-            payments.append(money[-1][2])
-        else:
-            change = money[-1][2]
-
-    return printed_total, payments, change
-
-
-def _report(
-    column: tuple[float, float] | None,
+    modifiers: list[tuple[int, Decimal, int]],
     items: list[LineItem],
-    printed_total: int | None,
-    payments: list[int],
-) -> list[str]:
-    """Say what the receipt did not yield, so nothing goes missing in silence."""
-    warnings = []
-    if column is None:
-        warnings.append("price_column_not_found")
-    if not items:
-        warnings.append("no_items_extracted")
-    if printed_total is None and not payments:
-        warnings.append("printed_total_not_found")
-    return warnings
+    warnings: list[str],
+) -> None:
+    """Give each quantity line to the neighbouring item its arithmetic fits.
+
+    The item printed below is tried first, then the one above.
+    """
+    for line_index, quantity, unit in modifiers:
+        below = next((i for i in items if i.line_index > line_index), None)
+        above = next((i for i in reversed(items) if i.line_index < line_index), None)
+        for item in (below, above):
+            if (
+                item is not None
+                and abs(times(quantity, unit) - item.line_total_minor) <= 1
+            ):
+                item.quantity, item.unit_price_minor = quantity, unit
+                item.quantity_source = "modifier"
+                break
+        else:
+            warnings.append(f"modifier_unattached:line{line_index}")
 
 
-def extract(lines: list[Line], profile: Profile) -> Extraction:
-    """Run extraction over a whole receipt."""
-    block = text_block(lines)
-    column = discover_price_column(lines, profile.money_re)
-    start, end = find_item_region(lines, profile)
-    vat_column = find_vat_column(lines[start:end], profile, block, column)
-
-    items: list[LineItem] = []
-    adjustments: list[Adjustment] = []
-    modifiers: list[Modifier] = []
-    warnings: list[str] = []
-    skipped: list[int] = []
-
-    glyph = median_glyph_height([w for line in lines for w in line.words])
-    for line in lines[start:end]:
-        rule = profile.rule_for(line.text)
-
-        # An allow list, so a new profile rule never turns its lines into items.
-        if rule not in ITEM_CANDIDATE_RULES:
-            continue
-        # A misread 'TOTALE EURO' matches no rule, but is still printed tall.
-        if median_glyph_height(line.words) > glyph * _TALL_LINE_RATIO:
-            continue
-
-        modifier = parse_modifier(line, profile)
-        if modifier is not None:
-            modifiers.append(modifier)
-            continue
-
-        money = _money_tokens(line, profile)
-        priced = price_candidates(line, money, block, column)
-        if not priced:
-            # No readable price. Lines with a description get a second reading.
-            if len(line.words) > 1:
-                skipped.append(line.index)
-            continue
-
-        amount = priced[-1][2]
-        if amount < 0 or rule == "discount":
-            first = min(f for f, _l, _v in money)
-            label = " ".join(
-                w.text for w in name_words(line.words[:first], block, vat_column)
-            )
-            # A discount whose minus sign was lost is still a discount.
-            adjustments.append(Adjustment("discount", label, -abs(amount), line.index))
-            continue
-
-        item = extract_item(
-            line, profile, block, column, money=money, vat_column=vat_column
-        )
-        if item is not None:
-            items.append(item)
-
-    for modifier in modifiers:
-        _attach(modifier, items, profile, warnings)
-
-    printed_total, payments, change = _scan_footer(lines, profile)
-    warnings += _report(column, items, printed_total, payments)
-
-    return Extraction(
-        items,
-        adjustments,
-        payments,
-        change,
-        printed_total,
-        warnings=warnings,
-        skipped_lines=skipped,
-        vat_column=vat_column,
+def _footer(lines: list[Line], fmt: Format, out: Extraction) -> None:
+    """Read the subtotal, the charges, the total, the payments and the change."""
+    labelled = [
+        (kind, money[-1][2], line)
+        for line in lines
+        if (kind := role(line.text)) and (money := money_tokens(line, fmt))
+    ]
+    # The total is the last one printed before the first payment.
+    paid = next(
+        (
+            i
+            for i, (kind, _a, _l) in enumerate(labelled)
+            if kind in {"payment", "change"}
+        ),
+        len(labelled),
     )
+    totals = [i for i, (kind, _a, _l) in enumerate(labelled[:paid]) if kind == "total"]
+    final = totals[-1] if totals else None
+
+    for index, (kind, amount, line) in enumerate(labelled):
+        before_total = final is None or index < final
+        if kind == "total" and index == final:
+            out.printed_total_minor = abs(amount)
+        elif (
+            kind in {"subtotal", "total"}
+            and before_total
+            and out.subtotal_minor is None
+        ):
+            # 'TOTAL', then rounding, then 'TOTAL ROUNDED': the first is a subtotal.
+            out.subtotal_minor = abs(amount)
+        elif kind in _CHARGES and before_total:
+            signed = -abs(amount) if kind == "discount" else amount
+            out.charges.append(Charge(kind, line.text, signed, line.index))
+        elif kind == "tax":
+            # Tax printed under the total is a breakdown of it, never added.
+            out.tax_breakdown_minor += abs(amount)
+        elif kind == "payment" and index >= paid:
+            out.payments_minor.append(abs(amount))
+        elif kind == "change":
+            out.change_minor = abs(amount)
+
+
+def _without_currency(line: Line, fmt: Format) -> Line:
+    """Drop a currency mark printed as its own word before an amount: 'Rp. 39.000'."""
+    words = [
+        word
+        for word, after in zip(line.words, [*line.words[1:], None], strict=True)
+        if not (
+            after is not None
+            and _CURRENCY_MARK.fullmatch(word.text)
+            and parse_amount(after.text, fmt) is not None
+        )
+    ]
+    return Line(words, line.index)
+
+
+def _in_column(text: str, fmt: Format) -> bool:
+    """Whether a word can mark the price column. Whole-number currencies print
+    quantities that look like prices, so there only three digits or more count.
+    """
+    amount = parse_amount(text, fmt)
+    return amount is not None and (fmt.places > 0 or abs(amount) >= 100)
+
+
+def _split(
+    lines: list[Line], fmt: Format, block: Block, column: tuple[float, float] | None
+) -> tuple[list[_Row], list[Line], int]:
+    """Split the receipt into priced rows, the lines between them, and the footer.
+
+    The items run up to the first footer label, or the first tall line: a total
+    is printed taller than the items even when its label is misread.
+    """
+    glyph = median_glyph_height([w for line in lines for w in line.words])
+    rows: list[_Row] = []
+    unpriced: list[Line] = []
+    for position, line in enumerate(lines):
+        money = money_tokens(line, fmt)
+        price = price_of(line, money, block, column)
+        kind = role(line.text)
+        tall = median_glyph_height(line.words) > glyph * _TALL_LINE_RATIO
+        if (price and kind in _FOOTER_START) or (
+            rows and (kind in _FOOTER_START or kind == "count" or (price and tall))
+        ):
+            return rows, unpriced, position
+        if price is None or _modifier(line, fmt):
+            unpriced.append(line)
+        else:
+            rows.append(_Row(line, money, price))
+    return rows, unpriced, len(lines)
+
+
+def _read_rows(
+    rows: list[_Row], unpriced: list[Line], block: Block, out: Extraction
+) -> None:
+    """Turn the priced rows into items and discounts, and note the lines left over."""
+    layout = _layout(rows, block)
+    out.vat_column = layout.vat_column
+    first_row = rows[0].line.index if rows else 0
+    by_index = {line.index: line for line in unpriced}
+    modifiers = [
+        (line.index, *modifier)
+        for line in unpriced
+        if line.index >= first_row - 1 and (modifier := _modifier(line, out.fmt))
+    ]
+    taken = {index for index, _quantity, _unit in modifiers}
+
+    for row in rows:
+        line, amount = row.line, row.price[2]
+        if amount < 0 or role(line.text) == "discount":
+            label = name_words(line.words[: row.money[0][0]], block, layout.vat_column)
+            # A discount whose minus sign was lost is still a discount.
+            out.adjustments.append(
+                Adjustment(" ".join(w.text for w in label), -abs(amount), line.index)
+            )
+            continue
+        # 'Populaire Chocolate' on one line, '1 4,500 4,500' on the next, or the
+        # other way round: a row with no name takes the free line beside it.
+        beside = next(
+            (
+                by_index[i]
+                for i in (line.index - 1, line.index + 1)
+                if i in by_index and i not in taken
+            ),
+            None,
+        )
+        item = _item(row, block, layout, beside)
+        if item is None:
+            continue
+        if item.borrowed_name:
+            taken.add(beside.index)
+        out.items.append(item)
+
+    _attach(modifiers, out.items, out.warnings)
+    # A line of column headings says where the items start, even when the first
+    # of them lost their prices.
+    start = max(
+        (l.index for l in unpriced if l.index < first_row and is_heading(l.text)),
+        default=first_row,
+    )
+    # Lines with a name and no price get a second reading, and a mention in review.
+    out.skipped_lines = [
+        line.index
+        for line in unpriced
+        if line.index > start and line.index not in taken and len(line.words) > 1
+    ]
+
+
+def extract(lines: list[Line]) -> Extraction:
+    """Run extraction over a whole receipt."""
+    fmt = detect_format(w.text for line in lines for w in line.words)
+    out = Extraction(fmt)
+    lines = [_without_currency(line, fmt) for line in lines]
+    block = text_block(lines)
+    column = discover_price_column(lines, lambda text: _in_column(text, fmt))
+
+    rows, unpriced, end = _split(lines, fmt, block, column)
+    _read_rows(rows, unpriced, block, out)
+    _footer(lines[end:], fmt, out)
+
+    if column is None:
+        out.warnings.append("price_column_not_found")
+    if not out.items:
+        out.warnings.append("no_items_extracted")
+    if out.printed_total_minor is None and not out.payments_minor:
+        out.warnings.append("printed_total_not_found")
+    return out

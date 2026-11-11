@@ -18,7 +18,7 @@ from quadra_core.pipeline.lines import (
 )
 from quadra_core.testdata import OCR as FIXTURES
 
-PRICE = re.compile(r"\d{1,3},\d{2}")
+PRICE = re.compile(r"\d{1,3},\d{2}").fullmatch
 
 # The eight products and the total, as printed on the synthetic receipt.
 ITEM_PRICES = ["2,98", "2,30", "4,95", "3,09", "3,45", "3,79", "7,90", "3,56"]

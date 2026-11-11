@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 
 import pytest
 
@@ -12,29 +11,24 @@ from quadra_core.pipeline.extract import extract
 from quadra_core.pipeline.lines import drop_speckle, group_lines, load_tsv
 from quadra_core.pipeline.review import reasons, status
 from quadra_core.pipeline.validate import validate
-from quadra_core.profiles import loader
 from quadra_core.testdata import OCR as FIXTURES
 
 EXPECTED_TOTALS = [298, 230, 495, 309, 345, 379, 790, 356]
 PRINTED_TOTAL = 3202
 
 
-def profile():
-    return next(p for p in loader.available() if p.id == "synthetic")
-
-
 def run(name: str):
     lines = group_lines(drop_speckle(load_tsv((FIXTURES / f"{name}.tsv").read_text())))
-    ex = extract(lines, profile())
-    return ex, validate(ex, profile())
+    ex = extract(lines)
+    return ex, validate(ex)
 
 
 def verdict(ex, v) -> str:
-    return status(ex, reasons(ex, v, profile()))
+    return status(ex, reasons(ex, v))
 
 
 def parse(name: str):
-    return parse_tsv((FIXTURES / f"{name}.tsv").read_text(), profile="synthetic")
+    return parse_tsv((FIXTURES / f"{name}.tsv").read_text())
 
 
 @pytest.mark.parametrize("name", ["synthetic_clean", "synthetic_faded"])
@@ -71,7 +65,7 @@ def test_unbalanced_receipt_is_caught_not_silently_accepted():
     ex, v = run("synthetic_unbalanced")
     assert not v.balanced
     assert v.delta_minor == 100
-    assert "total_mismatch" in [r.code for r in reasons(ex, v, profile())]
+    assert "total_mismatch" in [r.code for r in reasons(ex, v)]
 
 
 def test_degraded_receipt_goes_to_review_rather_than_lying():
@@ -107,27 +101,6 @@ def test_status_distinguishes_ok_from_review():
     assert (ok, review) == ("ok", "review")
 
 
-def test_profile_fingerprint_matches_from_degraded_ocr():
-    lines = [
-        l.text
-        for l in group_lines(
-            drop_speckle(load_tsv((FIXTURES / "synthetic_faded.tsv").read_text()))
-        )
-    ]
-    selected = loader.select(lines)
-    assert selected is not None
-    assert selected[0].id == "synthetic"
-
-
-def test_uncalibrated_profile_warns():
-    """An uncalibrated profile adds a warning."""
-    ex, _ = run("synthetic_clean")
-    base = profile()
-    scaffold = replace(base, id="scaffold", calibrated=False)
-    assert "profile_not_calibrated" in validate(ex, scaffold).warnings
-    assert "profile_not_calibrated" not in validate(ex, base).warnings
-
-
 def test_output_is_json_serialisable_and_uses_minor_units():
     doc = parse("synthetic_clean").document
     json.dumps(doc)  # must not raise
@@ -147,7 +120,7 @@ def test_the_same_ocr_always_gives_the_same_document():
 def _extraction(items_total: int, printed: int, payments: list[int]):
     """One item plus a footer, so only the three totals are under test."""
     tsv = (FIXTURES / "synthetic_clean.tsv").read_text()
-    ex = extract(group_lines(drop_speckle(load_tsv(tsv))), profile())
+    ex = extract(group_lines(drop_speckle(load_tsv(tsv))))
     ex.items = ex.items[:1]
     ex.items[0].line_total_minor = items_total
     ex.items[0].unit_price_minor = items_total
@@ -161,7 +134,7 @@ def _extraction(items_total: int, printed: int, payments: list[int]):
 def test_a_misread_printed_total_loses_to_items_and_payments_agreeing():
     """Items and payments agreeing on 101,29 beat a total misread as 101,24."""
     ex = _extraction(items_total=10129, printed=10124, payments=[10129])
-    result = validate(ex, profile())
+    result = validate(ex)
     assert result.balanced
     assert result.total_source == "payments"
     assert result.printed_total_minor == 10129
@@ -172,7 +145,7 @@ def test_a_misread_printed_total_loses_to_items_and_payments_agreeing():
 def test_printed_total_still_wins_when_nothing_corroborates_it():
     """Without corroboration the printed total stands."""
     ex = _extraction(items_total=9000, printed=10124, payments=[10129])
-    result = validate(ex, profile())
+    result = validate(ex)
     assert not result.balanced
     assert result.total_source == "printed"
     assert result.delta_minor == 9000 - 10124
@@ -182,9 +155,9 @@ def test_printed_total_still_wins_when_nothing_corroborates_it():
 def test_validating_twice_does_not_stack_flags():
     """parse_tsv validates again after a repair, on the same extraction."""
     ex, _ = run("synthetic_clean")
-    ex.items[0].quantity = None  # make one check fail
-    first = validate(ex, profile())
-    second = validate(ex, profile())
+    ex.items[0].unit_price_minor = None  # make one check fail
+    first = validate(ex)
+    second = validate(ex)
     assert ex.items[0].flags.count("quantity_unverified") == 1
     assert first.warnings == second.warnings
 
@@ -194,10 +167,10 @@ def test_a_repaired_item_can_come_back_clean():
     ex, _ = run("synthetic_clean")
     broken = ex.items[0].line_total_minor
     ex.items[0].line_total_minor = broken + 500
-    validate(ex, profile())
+    validate(ex)
     assert "quantity_unverified" in ex.items[0].flags
     ex.items[0].line_total_minor = broken
-    validate(ex, profile())
+    validate(ex)
     assert "quantity_unverified" not in ex.items[0].flags
 
 
@@ -220,7 +193,7 @@ def test_a_typed_in_total_is_never_overruled_by_the_payment_line():
     """A total typed in with --total is never overruled."""
     ex = _extraction(items_total=10129, printed=9999, payments=[10129])
     ex.printed_total_supplied = True
-    result = validate(ex, profile())
+    result = validate(ex)
     assert result.total_source == "supplied"
     assert result.printed_total_minor == 9999
     assert not any("printed_total_misread" in w for w in result.warnings)

@@ -8,12 +8,10 @@ from quadra_core.pipeline import recheck
 from quadra_core.pipeline.extract import Extraction, LineItem
 from quadra_core.pipeline.lines import Line, Word
 from quadra_core.pipeline.validate import Validation
-from quadra_core.profiles import loader
 
 
 def item(index: int, total: int, quantity_source: str = "implicit") -> LineItem:
     return LineItem(
-        description_raw=f"THING {index}",
         description=f"THING {index}",
         quantity=Decimal(1),
         quantity_source=quantity_source,
@@ -48,7 +46,7 @@ def repair_with(totals, printed, second, monkeypatch):
     readings = {index: [amount] for index, amount in second.items()}
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: readings)
     val = validation(printed, sum(totals) - printed)
-    return ex, recheck.repair(ex, val, object(), object(), [])
+    return ex, recheck.repair(ex, val, object(), [])
 
 
 # --- when it should act -----------------------------------------------------
@@ -60,7 +58,7 @@ def test_a_single_balancing_reading_is_taken(monkeypatch):
     assert got is not None
     assert got.changes == {0: (7239, 239)}
 
-    recheck.apply(ex, got, [], esselunga())
+    recheck.apply(ex, got, [])
     assert ex.items[0].line_total_minor == 239
     assert "price_reread" in ex.items[0].flags
 
@@ -68,7 +66,7 @@ def test_a_single_balancing_reading_is_taken(monkeypatch):
 def test_a_repaired_line_carries_its_unit_price_with_it(monkeypatch):
     """The unit price moves with the corrected total."""
     ex, got = repair_with([7239, 299, 239], 777, {0: 239}, monkeypatch)
-    recheck.apply(ex, got, [], esselunga())
+    recheck.apply(ex, got, [])
     assert ex.items[0].unit_price_minor == 239
 
 
@@ -78,8 +76,8 @@ def test_a_quantity_from_a_modifier_keeps_its_unit_price(monkeypatch):
     ex.items[0].quantity_source = "modifier"
     ex.items[0].unit_price_minor = 100
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: {0: [239]})
-    got = recheck.repair(ex, validation(239, 7000), object(), object(), [])
-    recheck.apply(ex, got, [], esselunga())
+    got = recheck.repair(ex, validation(239, 7000), object(), [])
+    recheck.apply(ex, got, [])
     assert ex.items[0].unit_price_minor == 100
 
 
@@ -101,14 +99,14 @@ def test_a_receipt_that_already_adds_up_is_left_alone(monkeypatch):
 
     monkeypatch.setattr(recheck, "second_opinion", spy)
     ex = extraction([100, 200])
-    assert recheck.repair(ex, validation(300, 0), object(), object(), []) is None
+    assert recheck.repair(ex, validation(300, 0), object(), []) is None
     assert not calls, "a balanced receipt must not pay for a second reading"
 
 
 def test_nothing_happens_without_a_total_to_balance_against(monkeypatch):
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: {0: [1]})
     ex = extraction([100])
-    assert recheck.repair(ex, validation(None, 5), object(), object(), []) is None
+    assert recheck.repair(ex, validation(None, 5), object(), []) is None
 
 
 def test_nothing_happens_when_no_reading_balances(monkeypatch):
@@ -140,14 +138,10 @@ def test_a_recovered_line_does_not_shift_the_other_corrections():
         Line(words=[Word("BREAD", 0, 90, 50, 10, 90.0)], index=9),
     ]
     result = recheck.Repair(changes={9: (250, 999)}, recovered={7: 50}, disputed=2)
-    recheck.apply(ex, result, lines, esselunga())
+    recheck.apply(ex, result, lines)
 
     by_line = {i.line_index: i.line_total_minor for i in ex.items}
     assert by_line == {5: 100, 7: 50, 9: 999}
-
-
-def esselunga():
-    return next(p for p in loader.available() if p.id == "esselunga")
 
 
 # --- several readings -------------------------------------------------------
@@ -159,7 +153,7 @@ def test_the_answer_most_readings_agree_on_wins_when_two_balance(monkeypatch):
     monkeypatch.setattr(
         recheck, "second_opinion", lambda *a, **k: {0: [20, 20], 1: [200]}
     )
-    got = recheck.repair(ex, validation(320, 100), object(), object(), [])
+    got = recheck.repair(ex, validation(320, 100), object(), [])
     assert got is not None
     assert got.changes == {0: (120, 20)}
 
@@ -170,7 +164,7 @@ def test_votes_rank_answers_that_balance_but_never_make_one_balance(monkeypatch)
     monkeypatch.setattr(
         recheck, "second_opinion", lambda *a, **k: {0: [239, 7239, 7239]}
     )
-    got = recheck.repair(ex, validation(538, 7000), object(), object(), [])
+    got = recheck.repair(ex, validation(538, 7000), object(), [])
     assert got is not None
     assert got.changes == {0: (7239, 239)}
 
@@ -197,11 +191,11 @@ def test_a_dropped_discount_comes_back_as_a_discount(monkeypatch):
         ),
     ]
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: {1: [51, -51, -51]})
-    got = recheck.repair(ex, validation(118, 51), object(), esselunga(), lines)
+    got = recheck.repair(ex, validation(118, 51), object(), lines)
     assert got is not None
     assert got.recovered == {1: -51}
 
-    recheck.apply(ex, got, lines, esselunga())
+    recheck.apply(ex, got, lines)
     assert [(a.label, a.amount_minor) for a in ex.adjustments] == [("SCONTO 30%", -51)]
     assert ex.skipped_lines == [], "a recovered line still reported as priceless"
 
@@ -221,7 +215,7 @@ def test_a_recovered_line_leaves_the_failed_price_reading_out_of_its_name():
         )
     ]
     result = recheck.Repair(recovered={4: 169}, disputed=1, column_left=200)
-    recheck.apply(ex, result, lines, esselunga())
+    recheck.apply(ex, result, lines)
 
     [got] = ex.items
     assert got.description == "YOGA NETT.ALBICOCCA1L"
@@ -242,7 +236,7 @@ def test_the_total_may_not_overrule_the_readings_on_more_than_one_line(monkeypat
     ex = extraction([100, 200, 300])
     second = {0: [150, 150], 1: [250, 250], 2: [310, 310]}
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: second)
-    assert recheck.repair(ex, validation(610, -10), object(), object(), []) is None
+    assert recheck.repair(ex, validation(610, -10), object(), []) is None
 
 
 def test_a_stray_description_word_does_not_widen_the_column():
@@ -272,7 +266,7 @@ def test_a_sign_in_the_column_marks_a_discount_the_label_hid(monkeypatch):
         Line(words=[Word("SCINTO", 20, 20, 60, 10, 90.0)], index=1),
     ]
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: {1: [51, -51]})
-    got = recheck.repair(ex, validation(118, 51), object(), esselunga(), lines)
+    got = recheck.repair(ex, validation(118, 51), object(), lines)
     assert got is not None
     assert got.recovered == {1: -51}
 
@@ -280,7 +274,7 @@ def test_a_sign_in_the_column_marks_a_discount_the_label_hid(monkeypatch):
 def test_a_nameless_price_repeating_its_neighbour_is_dropped(monkeypatch):
     """A nameless line repeating its neighbour's price is dropped."""
     ex = extraction([596])
-    ex.items[0].description = ex.items[0].description_raw = "="
+    ex.items[0].description = "="
     ex.items[0].line_index = 1
     ex.skipped_lines = [0, 2]
     lines = [
@@ -293,12 +287,12 @@ def test_a_nameless_price_repeating_its_neighbour_is_dropped(monkeypatch):
     ]
     second = {0: [596, 596], 2: [233, 233]}
     monkeypatch.setattr(recheck, "second_opinion", lambda *a, **k: second)
-    got = recheck.repair(ex, validation(829, -233), object(), esselunga(), lines)
+    got = recheck.repair(ex, validation(829, -233), object(), lines)
     assert got is not None
     assert got.recovered == {0: 596, 2: 233}
     assert got.changes == {1: (596, 0)}
 
-    recheck.apply(ex, got, lines, esselunga())
+    recheck.apply(ex, got, lines)
     assert [(i.description, i.line_total_minor) for i in ex.items] == [
         ("PINSA", 596),
         ("STAR", 233),

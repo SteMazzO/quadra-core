@@ -11,16 +11,7 @@ jsonschema = pytest.importorskip("jsonschema")
 from quadra_core import SCHEMA_PATH, parse_tsv  # noqa: E402
 from quadra_core.testdata import OCR as FIXTURES  # noqa: E402
 
-CASES = [
-    ("esselunga_photo_payments", "esselunga"),
-    ("esselunga_photo_modifier", "esselunga"),
-    ("esselunga_a", "esselunga"),
-    ("esselunga_b", "esselunga"),
-    ("esselunga_b_faded", "esselunga"),
-    ("synthetic_clean", "synthetic"),
-    ("synthetic_faded", "synthetic"),
-    ("synthetic_unbalanced", "synthetic"),
-]
+CASES = sorted(path.stem for path in FIXTURES.glob("*.tsv"))
 
 
 @pytest.fixture(scope="module")
@@ -32,11 +23,9 @@ def test_schema_is_itself_valid(schema):
     jsonschema.Draft202012Validator.check_schema(schema)
 
 
-@pytest.mark.parametrize("name,profile", CASES)
-def test_fixture_output_validates(schema, name, profile):
-    document = parse_tsv(
-        (FIXTURES / f"{name}.tsv").read_text(), profile=profile
-    ).document
+@pytest.mark.parametrize("name", CASES)
+def test_fixture_output_validates(schema, name):
+    document = parse_tsv((FIXTURES / f"{name}.tsv").read_text()).document
     jsonschema.Draft202012Validator(schema).validate(document)
 
 
@@ -65,6 +54,4 @@ def test_schema_rejects_fields_it_does_not_define(schema):
 
 
 def esselunga_b():
-    return parse_tsv(
-        (FIXTURES / "esselunga_b.tsv").read_text(), profile="esselunga"
-    ).document
+    return parse_tsv((FIXTURES / "esselunga_b.tsv").read_text()).document

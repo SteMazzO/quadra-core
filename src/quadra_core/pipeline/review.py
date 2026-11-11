@@ -15,7 +15,6 @@ from quadra_core.pipeline.extract import Extraction, name_words
 from quadra_core.pipeline.lines import Line, text_block
 from quadra_core.pipeline.money import format_minor
 from quadra_core.pipeline.validate import Validation
-from quadra_core.profiles.loader import Profile
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +81,7 @@ def _total_reasons(
 def _item_reasons(extraction: Extraction, money) -> list[Reason]:
     out = []
     for index, item in enumerate(extraction.items):
-        price = money(item.line_total_minor or 0)
+        price = money(item.line_total_minor)
         if "price_unconfirmed" in item.flags:
             before = (
                 f"Read as {money(item.first_read_minor)}"
@@ -106,7 +105,7 @@ def _item_reasons(extraction: Extraction, money) -> list[Reason]:
                     index,
                 )
             )
-        if {"quantity_unverified", "quantity_disagreement"} & set(item.flags):
+        if "quantity_unverified" in item.flags:
             out.append(
                 Reason(
                     "quantity_unverified",
@@ -145,17 +144,12 @@ def _missing_prices(extraction: Extraction, lines: Sequence[Line]) -> list[Reaso
 
 
 def reasons(
-    extraction: Extraction,
-    validation: Validation,
-    profile: Profile,
-    lines: Sequence[Line] = (),
+    extraction: Extraction, validation: Validation, lines: Sequence[Line] = ()
 ) -> list[Reason]:
     """Everything a person has to check on this receipt, total first."""
 
     def money(minor: int) -> str:
-        return format_minor(
-            minor, places=profile.decimal_places, separator=profile.decimal_separator
-        )
+        return format_minor(minor, extraction.fmt)
 
     if not extraction.items:
         return [Reason("no_items", "items", "No items were found on the receipt.")]

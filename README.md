@@ -5,15 +5,15 @@
 [![PyPI Python](https://img.shields.io/pypi/pyversions/quadra-core?logo=pypi)](https://pypi.org/project/quadra-core/)
 [![codecov](https://codecov.io/github/SteMazzO/quadra-core/coverage.svg?branch=main)](https://codecov.io/github/SteMazzO/quadra-core?branch=main)
 
-Reads a supermarket till receipt from a photo. No ML model, no network calls: Tesseract does the OCR, then geometry and arithmetic do the rest.
+Reads a shop or restaurant receipt from a photo, from any shop and any country. No LLM, no network calls, no per-shop configuration: Tesseract does the OCR, then geometry and arithmetic do the rest.
 
 ```python
 from quadra_core import parse_image
 
 receipt = parse_image("receipt.jpg")
 
-receipt.status      # "ok", "review" or "failed"
-receipt.document    # the items, discounts and totals, ready for JSON
+receipt.status  # "ok", "review" or "failed"
+receipt.document  # the items, discounts and totals, ready for JSON
 ```
 
     pip install quadra-core
@@ -44,7 +44,9 @@ Items with an entry also carry `"needs_review": true`, so a review screen can hi
 
 ## How it decides
 
-The line totals plus the discounts have to equal the total, so the parser can check its own work.
+Nothing is configured per shop. The parser works out from the receipt itself how money is printed (`1.234,56`, `1,234.56`, or whole numbers like `12,000`), where the price column is, and whether quantities are printed before the name, before the price, or on a line of their own. The footer is found by the words receipts use for it (total, subtotal, tax, service, discount, cash, change) in the main languages written in Latin script.
+
+The line totals plus the discounts have to equal the total, so the parser can check its own work. Tax is printed the same way whether prices include it or not, so the arithmetic decides: a tax or service line counts as added on top only if the total needs it.
 
 When they don't, it reads the price column again on its own, three different ways, and looks for the prices that make the receipt add up. The arithmetic only *proposes*. A correction is accepted without review only when both of these hold:
 
@@ -58,14 +60,13 @@ Anything less is kept as a suggestion, and that line goes to review. Prices are 
 Type it in, and every line is checked against it:
 
 ```python
-receipt = parse_image("receipt.jpg", total=10125)   # minor units: 101,25
+receipt = parse_image("receipt.jpg", total=10125)  # minor units: 101,25
 ```
 
 ## Command line
 
     quadra-core parse receipt.jpg                 # prints the JSON
     quadra-core parse receipt.jpg --total 101,25
-    quadra-core profiles                          # the shops supported
 
 The exit code is the status: 0 ok, 1 review, 2 failed, 3 error.
 
@@ -75,40 +76,33 @@ The exit code is the status: 0 ok, 1 review, 2 failed, 3 error.
 |---|---|
 | `status`, `review` | as above |
 | `line_items` | description, quantity (a decimal string), unit price, line total, the discount printed under it, VAT code, and where it sits on the photo |
-| `adjustments` | the discounts, each pointing at the item it applies to |
-| `totals` | subtotal, discounts, the computed total, the total it was checked against and where that came from (`printed`, `payments` or `supplied`), and the difference |
+| `adjustments` | the discounts printed among the items, each pointing at the item it applies to |
+| `charges` | tax, service, rounding and footer discounts, each with `applied`: whether the total includes it on top of the items |
+| `totals` | the items' sum, discounts, the printed subtotal and tax, the computed total, the total it was checked against and where that came from (`printed`, `payments` or `supplied`), and the difference |
+| `decimal_places` | how many digits of every amount are decimals on this receipt: 2 for euros, 0 for rupiah |
 | `warnings`, `ocr` | debugging detail |
 
-Money is always in integer minor units (cents). A field the parser could not read is `null`; it is never guessed. [The JSON Schema](src/quadra_core/schema/receipt-2.0.0.schema.json) is exported as `quadra_core.SCHEMA_PATH`.
+Money is always in integer minor units (cents, or whole units where `decimal_places` is 0). A field the parser could not read is `null`; it is never guessed. [The JSON Schema](src/quadra_core/schema/receipt-3.0.0.schema.json) is exported as `quadra_core.SCHEMA_PATH`.
 
 `receipt.tsv` and `receipt.image` hold the OCR and the prepared photo that item boxes refer to, if you want to archive them. You can re-parse the TSV later with `parse_tsv`, without the photo.
 
-## Adding a shop
+## Accuracy
 
-Everything shop-specific is a TOML profile in `src/quadra_core/profiles/`. The code knows how to find a price column, and the profile says what a price looks like.
+`benchmarks/` scores the parser on public datasets. On [CORD](https://github.com/clovaai/cord) (Indonesian shop and restaurant receipts), fed the dataset's own transcription so that only the parsing is measured:
 
-Start with a stub, since `calibrate.py` needs a profile to report against:
+    uv run --group bench python benchmarks/run.py cord --split validation
 
-```toml
-# src/quadra_core/profiles/myshop.toml
-[profile]
-id = "myshop"
-version = 1
-calibrated = false
+| CORD | validation, 100 receipts (tuned on) | train sample, 200 receipts (not tuned on) |
+|---|---|---|
+| total read exactly | 95% | 85% |
+| line totals, F1 | 0.97 | 0.94 |
+| receipts with every amount right | 84% | 80% |
+| receipts called `ok` | 80% | 75% |
+| ...of which every amount is right | 97.5% | 98.7% |
 
-[format]
-money = '\d{1,3},\d{2}'
-```
+The two validation receipts called `ok` but scored wrong are annotation slips in the dataset. Reading photos end to end adds the OCR engine's own errors on top; those numbers are not measured yet.
 
-Then point it at a photo:
-
-    python tools/calibrate.py receipt.jpg --profile myshop
-
-It prints what Tesseract read, where the price column landed, which rule matched each line, and what a person would be asked to review. Add `[[rules]]` and `[regions]` anchors until the lines stop coming back as `unknown`. Rules are tried in order and the first match wins, so put the specific ones first.
-
-Add `[fingerprint]` anchors so the shop is recognised without `--profile`. A VAT number is more stable than a branch address. Save the OCR as a fixture with `--save-fixture NAME` so later changes have something to regress against. Set `calibrated = true` once it balances, otherwise every parse carries a `profile_not_calibrated` warning.
-
-Before committing a fixture, check it for personal data: the address, the loyalty card number, the points balance. `tools/scrub.py` covers the Esselunga ones.
+`benchmarks/show.py` prints what the parser saw on any receipt it got wrong. Datasets are downloaded from their own homes into `~/.cache/quadra-bench`.
 
 ## Development
 

@@ -10,15 +10,13 @@ from pathlib import Path
 
 from quadra_core.parse import Result, parse_image, parse_tsv
 from quadra_core.pipeline.ocr import OcrError
-from quadra_core.profiles.loader import ProfileError
 
 # The JSON Schema every document validates against.
-SCHEMA_PATH = Path(__file__).parent / "schema" / "receipt-2.0.0.schema.json"
+SCHEMA_PATH = Path(__file__).parent / "schema" / "receipt-3.0.0.schema.json"
 
 __all__ = [
     "SCHEMA_PATH",
     "OcrError",
-    "ProfileError",
     "Result",
     "parse_image",
     "parse_tsv",

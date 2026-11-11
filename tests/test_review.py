@@ -8,16 +8,12 @@ from quadra_core.pipeline import recheck
 from quadra_core.pipeline.document import build
 from quadra_core.pipeline.extract import extract
 from quadra_core.pipeline.lines import Word, group_lines
+from quadra_core.pipeline.money import Format
 from quadra_core.pipeline.review import reasons, status
 from quadra_core.pipeline.validate import validate
-from quadra_core.profiles import loader
 
 GLYPH = 24
 ROW = 40
-
-
-def esselunga():
-    return next(p for p in loader.available() if p.id == "esselunga")
 
 
 def receipt(*rows: str):
@@ -47,12 +43,12 @@ HEADER = ("* Esselunga S.p.A. *", "P.I. 04916380159", "IVA | EURO")
 
 def parsed(*rows: str):
     lines = receipt(*HEADER, *rows)
-    ex = extract(lines, esselunga())
-    return lines, ex, validate(ex, esselunga())
+    ex = extract(lines)
+    return lines, ex, validate(ex)
 
 
 def codes(ex, v):
-    return [r.code for r in reasons(ex, v, esselunga())]
+    return [r.code for r in reasons(ex, v)]
 
 
 # --- what the first reading gets right on its own ---------------------------
@@ -90,9 +86,7 @@ def test_a_discount_belongs_to_the_item_printed_above_it():
         "SCONTO FIDATY ORO | 0,26-S",
         "TOTALE EURO | 3,33",
     )
-    document = build(
-        lines=lines, extraction=ex, validation=v, profile=esselunga(), ocr_meta={}
-    )
+    document = build(lines=lines, extraction=ex, validation=v, ocr_meta={})
     assert document["adjustments"][0]["applies_to"] == 1
     assert [i["discount_minor"] for i in document["line_items"]] == [0, -26]
 
@@ -102,7 +96,7 @@ def test_a_discount_belongs_to_the_item_printed_above_it():
 
 def test_a_receipt_that_adds_up_needs_no_review():
     _, ex, v = parsed("LATTE | *a | 1,00", "PANE | *a | 2,00", "TOTALE EURO | 3,00")
-    assert reasons(ex, v, esselunga()) == []
+    assert reasons(ex, v) == []
     assert status(ex, []) == "ok"
 
 
@@ -118,7 +112,7 @@ def test_the_lines_without_a_price_are_named_when_money_is_missing():
         "NESCAFE' DG ROMA | *d | xx",
         "TOTALE EURO | 6,99",
     )
-    found = reasons(ex, v, esselunga(), lines)
+    found = reasons(ex, v, lines)
     assert [r.code for r in found] == ["total_mismatch", "price_missing"]
     assert found[1].message == "No price read for “NESCAFE' DG ROMA”."
 
@@ -143,10 +137,10 @@ def rereads(monkeypatch, readings):
 def repaired(monkeypatch, readings, *rows):
     lines, ex, v = parsed(*rows)
     rereads(monkeypatch, readings)
-    result = recheck.repair(ex, v, object(), esselunga(), lines)
+    result = recheck.repair(ex, v, object(), lines)
     if result is not None:
-        recheck.apply(ex, result, lines, esselunga())
-    return ex, validate(ex, esselunga())
+        recheck.apply(ex, result, lines)
+    return ex, validate(ex)
 
 
 CUKI = ("CUKI | *d | 1,95", "DISARONNO | *d | 9,59")
@@ -177,7 +171,7 @@ def test_a_correction_the_readings_split_on_is_only_a_suggestion(monkeypatch):
         "PAGAMENTO CARTA | 11,54",
     )
     assert ex.items[0].line_total_minor == 195
-    found = reasons(ex, v, esselunga())
+    found = reasons(ex, v)
     assert [(r.code, r.item) for r in found] == [("price_unconfirmed", 0)]
     assert found[0].message == "Read as 1,98; 1,95 would make the receipt add up."
 
@@ -210,9 +204,7 @@ def test_prices_are_never_bent_towards_a_disputed_total(monkeypatch):
 
 def test_every_item_named_in_the_review_is_marked_for_it(monkeypatch):
     lines, ex, v = parsed("CUKI | *d | 1,95", "X9 | *d | 80,99", "TOTALE EURO | 1,95")
-    document = build(
-        lines=lines, extraction=ex, validation=v, profile=esselunga(), ocr_meta={}
-    )
+    document = build(lines=lines, extraction=ex, validation=v, ocr_meta={})
     named = {r["item"] for r in document["review"] if r["item"] is not None}
     marked = {i["index"] for i in document["line_items"] if i["needs_review"]}
     assert named == marked == {1}
@@ -236,9 +228,9 @@ def test_every_item_named_in_the_review_is_marked_for_it(monkeypatch):
     ],
 )
 def test_the_column_reread_reads_through_thermal_print_misreads(text, cents):
-    assert recheck.read_cell(text, esselunga()) == cents
+    assert recheck.read_cell(text, Format()) == cents
 
 
 @pytest.mark.parametrize("text", ["1449", "0,3546", "bi", "1,865", "3,7"])
 def test_the_column_reread_refuses_what_it_cannot_tell(text):
-    assert recheck.read_cell(text, esselunga()) is None
+    assert recheck.read_cell(text, Format()) is None

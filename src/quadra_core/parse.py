@@ -17,7 +17,6 @@ from quadra_core.pipeline.lines import (
     median_glyph_height,
 )
 from quadra_core.pipeline.validate import validate
-from quadra_core.profiles import loader
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
 
@@ -36,32 +35,15 @@ class Result:
         return self.document["status"]
 
 
-def _profile(profile: str | None, texts: list[str]) -> loader.Profile:
-    if profile:
-        for candidate in loader.available():
-            if candidate.id == profile:
-                return candidate
-        raise loader.ProfileError(f"no such profile: {profile}")
-    selected = loader.select(texts)
-    if selected is None:
-        raise loader.ProfileError(
-            "could not tell which shop this receipt is from; pass profile=... "
-            "(see `quadra-core profiles`)"
-        )
-    return selected[0]
-
-
 def parse_tsv(
     tsv: str,
     *,
-    profile: str | None = None,
     total: int | None = None,
     image: Any = None,
     ocr: dict[str, Any] | None = None,
 ) -> Result:
     """Turn Tesseract TSV into a receipt. Never raises on a hard-to-read receipt.
 
-    `profile` names the shop; without it the shop is recognised from the text.
     `total` is the receipt total in minor units, for when a person has read it.
     `image`, the image the TSV came from, lets an unbalanced receipt have its
     price column read again.
@@ -70,28 +52,25 @@ def parse_tsv(
         raise ValueError(f"total must be positive minor units, got {total}")
 
     lines = group_lines(drop_speckle(load_tsv(tsv)))
-    shop = _profile(profile, [line.text for line in lines])
-
-    extraction = extract(lines, shop)
+    extraction = extract(lines)
     if total is not None:
         extraction.printed_total_minor = total
         extraction.printed_total_supplied = True
         if "printed_total_not_found" in extraction.warnings:
             extraction.warnings.remove("printed_total_not_found")
-    validation = validate(extraction, shop)
+    validation = validate(extraction)
 
     if image is not None and not validation.balanced:
-        repair = recheck.repair(extraction, validation, image, shop, lines)
+        repair = recheck.repair(extraction, validation, image, lines)
         if repair is not None:
-            recheck.apply(extraction, repair, lines, shop)
+            recheck.apply(extraction, repair, lines)
             # Validate again from scratch, so the checks see the new prices.
-            validation = validate(extraction, shop)
+            validation = validate(extraction)
 
     document = build(
         lines=lines,
         extraction=extraction,
         validation=validation,
-        profile=shop,
         ocr_meta=ocr or {},
     )
     return Result(document, tsv, image)
@@ -161,9 +140,7 @@ def _readings(path: Path) -> Iterator[tuple[str, Any, dict[str, Any]]]:
     yield read(fine, fine_report.steps)
 
 
-def parse_image(
-    path: str | Path, *, profile: str | None = None, total: int | None = None
-) -> Result:
+def parse_image(path: str | Path, *, total: int | None = None) -> Result:
     """Read a receipt photo. Never raises on a hard-to-read receipt.
 
     If the first reading does not add up, the photo is read again in other ways
@@ -171,7 +148,7 @@ def parse_image(
     """
     best: Result | None = None
     for tsv, image, meta in _readings(Path(path)):
-        result = parse_tsv(tsv, profile=profile, total=total, image=image, ocr=meta)
+        result = parse_tsv(tsv, total=total, image=image, ocr=meta)
         if best is None or _rank(result.document) > _rank(best.document):
             best = result
         if _settled(best.document):

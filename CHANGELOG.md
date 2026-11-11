@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Receipts from any shop and country are read with no configuration.
+- The money format is detected per receipt: `1.234,56`, `1,234.56`, whole numbers like `12,000`, or three decimals.
+- Quantities are found wherever they are printed: before the name, before the price, as `x2`, or on a line of their own.
+- A name printed on the line above or below its price is joined to it.
+- `charges`: tax, service, rounding and footer discounts, each saying whether the total includes it on top of the items.
+- `totals.subtotal_minor`, `totals.tax_minor` and `decimal_places`.
+- Footer labels are recognised in the main languages written in Latin script.
+- `benchmarks/`, which scores the parser on public datasets.
+
+### Changed
+
+- **Breaking:** new JSON schema, `receipt-3.0.0`. `profile` and `currency` are gone; adjustments no longer carry `kind`.
+- A price may miss a printed subtotal by one unit of rounding and still balance.
+- A price is flagged as implausible only above the total before discounts.
+
+### Removed
+
+- **Breaking:** shop profiles, the `profile=` argument, `--profile`, the `profiles` command and `ProfileError`.
+- `tools/calibrate.py`; `benchmarks/show.py` shows what the parser saw.
+
 ## [0.2.0] - 2026-10-01
 
 ### Added

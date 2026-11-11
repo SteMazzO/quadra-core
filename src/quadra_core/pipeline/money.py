@@ -1,155 +1,124 @@
-"""Parse money and quantities. Past this module, money is always whole cents."""
+"""Read printed amounts. Past this module, money is always whole minor units."""
 
 from __future__ import annotations
 
 import re
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from collections import Counter
+from collections.abc import Iterable
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
-# Characters OCR mixes up inside numbers. Only applied to tokens that look numeric.
-NUMERIC_CONFUSIONS: dict[str, str] = {
-    "O": "0",
-    "o": "0",
-    "Q": "0",
-    "D": "0",
-    "I": "1",
-    "l": "1",
-    "|": "1",
-    "!": "1",
-    "S": "5",
-    "s": "5",
-    "B": "8",
-    "Z": "2",
-    "z": "2",
-    "G": "6",
-    "b": "6",
-    "T": "7",
-    "g": "9",
-    "q": "9",
-}
 
-_STRIP = re.compile(r"[^0-9.,]")
+@dataclass(frozen=True, slots=True)
+class Format:
+    """How one receipt prints money: '1.234,56', '1,234.56', '12,000' or '1.250'."""
 
-# A trailing minus, as in Esselunga's '7,20-S'. Any character may follow the dash,
-# since OCR sometimes reads that S as a digit.
-TRAILING_SIGN = re.compile(r"-\s*[^\s]?\s*$")
+    separator: str = ","
+    places: int = 2
 
-# Anything longer is garbage, and could overflow Decimal's default precision.
-MAX_NUMERIC_LEN = 20
 
 # What OCR returns for a decimal separator, e.g. '1;;19' or '2/76'.
-_SEPARATOR_CONFUSIONS = ",.;:/\u00b7\u2022\u201a"
-# Only between digits, so text like '8x.' is left alone.
-_SEPARATOR_RUN = re.compile(f"(?<=\\d)[{re.escape(_SEPARATOR_CONFUSIONS)}]+(?=\\d)")
+_SEPARATORS = re.escape(",.;:/\u00b7\u2022\u201a")
+_GROUPED = r"\d{1,3}(?:[.,']\d{3})+|\d+"
+_SHAPES = {
+    places: re.compile(
+        rf"({_GROUPED})[{_SEPARATORS}]+(\d{{{places}}})"
+        if places
+        else rf"({_GROUPED})()"
+    )
+    for places in (0, 2, 3)
+}
+
+# A number with whatever is stuck to it: 'Rp58000.00', '7,20-S', '(5.00)', '$3.99'.
+_TOKEN = re.compile(r"(?P<lead>\D*)(?P<body>\d(?:.*\d)?)(?P<tail>\D*)")
+# The currency marks receipts print against an amount.
+CURRENCY = r"rp|rm|idr|myr|eur|euro|usd|gbp|chf|sgd|rs|inr|kr|zl|pln|tl|try|[$€£¥₹₺₩₫₱]"
+# Before: a currency mark. After: a tax letter. Around both, whatever specks OCR adds.
+_LEAD = re.compile(rf"[^\w%]*(?:{CURRENCY})?[^\w%]*", re.IGNORECASE)
+_TAIL = re.compile(r"[^\w%]*[^\W\d_]?[^\w%]*")
+_TRAILING_MINUS = re.compile("(?<=\\d)[-\u2013\u2014]\\S?$")
+
+# More digits than any receipt total: a barcode or a phone number.
+_MAX_DIGITS = 9
 
 
-def normalize_separators(token: str, separator: str = ",") -> str:
-    """Rewrite lookalike separators, including doubled ones, as `separator`."""
+def parse_amount(text: str, fmt: Format) -> int | None:
+    """Read one word as money in this receipt's format, or None if it is not."""
+    # A trailing minus, as in '7,20-S'. OCR sometimes reads that letter as a digit.
+    text, minus = _TRAILING_MINUS.subn("", text.strip())
+    token = _TOKEN.fullmatch(text)
     if not token:
-        return token
-    sign = TRAILING_SIGN.search(token)
-    suffix = sign.group(0) if sign else ""
-    core = token[: sign.start()] if sign else token
-    return _SEPARATOR_RUN.sub(separator, core) + suffix
+        return None
+    lead, body, tail = token.group("lead", "body", "tail")
+    if not _LEAD.fullmatch(lead) or not _TAIL.fullmatch(tail):
+        return None
+    # Without decimals to go by, '500G' and '4X' are sizes, not prices.
+    if not fmt.places and any(c.isalpha() for c in tail):
+        return None
+    shape = _SHAPES[fmt.places].fullmatch(body)
+    if not shape:
+        return None
+    digits = re.sub(r"\D", "", shape.group(1)) + shape.group(2)
+    if len(digits) > _MAX_DIGITS:
+        return None
+    negative = minus or "-" in lead or ("(" in lead and ")" in tail)
+    return -int(digits) if negative else int(digits)
 
 
-def strip_sign(token: str) -> str:
-    """Strip a leading or trailing sign, and any VAT letter after it."""
-    return TRAILING_SIGN.sub("", token).lstrip("-").strip()
+_DECIMAL = re.compile(rf"(?:{_GROUPED})([.,])\d{{2}}")
+_THOUSANDS = re.compile(r"\d{1,3}(?:([.,])\d{3})+")
 
 
-def digit_ratio(token: str) -> float:
-    """Fraction of the characters that are digits."""
-    if not token:
-        return 0.0
-    return sum(c.isdigit() for c in token) / len(token)
+def detect_format(words: Iterable[str]) -> Format:
+    """Work out how a receipt prints money from the numbers on it.
 
-
-def repair_numeric(token: str) -> str:
-    """Fix common misreads in a token we already believe is numeric."""
-    return "".join(NUMERIC_CONFUSIONS.get(c, c) for c in token)
-
-
-def parse_money(
-    token: str,
-    *,
-    places: int = 2,
-    repair: bool = True,
-    min_digit_ratio: float = 0.4,
-) -> int | None:
-    """Parse a money token to whole cents, or None if it is not money.
-
-    The decimal separator is worked out from the token, not passed in.
+    Two digits after the last separator are decimals. Groups of three are
+    thousands, unless a number starts '0.', which no grouped number does.
     """
-    if not token:
+    decimal: Counter[str] = Counter()
+    thousands: Counter[str] = Counter()
+    leading_zero = False
+    for word in words:
+        token = _TOKEN.fullmatch(word)
+        if not token or "%" in token.group("tail"):
+            continue
+        body = token.group("body")
+        if found := _DECIMAL.fullmatch(body):
+            decimal[found.group(1)] += 1
+        elif found := _THOUSANDS.fullmatch(body):
+            thousands[found.group(1)] += 1
+            leading_zero = leading_zero or body.startswith("0")
+    if decimal and decimal.total() >= thousands.total():
+        return Format(decimal.most_common(1)[0][0], 2)
+    if thousands and leading_zero:
+        return Format(thousands.most_common(1)[0][0], 3)
+    return Format(".", 0)
+
+
+_QUANTITY = re.compile(r"[x*@]?(\d{1,4}(?:[.,]\d{1,3})?)[x*@]?", re.IGNORECASE)
+
+
+def parse_quantity(text: str) -> Decimal | None:
+    """Read a quantity such as '2', 'x2', '3x' or the weight '1,240'."""
+    found = _QUANTITY.fullmatch(text.strip())
+    if not found:
         return None
-
-    negative = bool(TRAILING_SIGN.search(token)) or token.lstrip().startswith("-")
-    token = TRAILING_SIGN.sub("", token).lstrip("-")
-
-    if repair and digit_ratio(token) >= min_digit_ratio:
-        candidate = repair_numeric(token)
-    else:
-        candidate = token
-    candidate = _STRIP.sub("", candidate)
-    if not candidate or not any(c.isdigit() for c in candidate):
-        return None
-    if len(candidate) > MAX_NUMERIC_LEN:
-        return None
-
-    # A separator followed by exactly `places` digits is the decimal point.
-    if places:
-        tail = re.search(r"[.,](\d+)$", candidate)
-        if tail and len(tail.group(1)) == places:
-            candidate = candidate[: tail.start()].replace(",", "").replace(".", "")
-            candidate = f"{candidate or '0'}.{tail.group(1)}"
-        elif tail:
-            # '1,5' could be 1,50 or 15, so refuse.
-            return None
-        else:
-            candidate = candidate.replace(",", "").replace(".", "")
-    else:
-        candidate = candidate.replace(",", "").replace(".", "")
-
     try:
-        value = Decimal(candidate)
-    except InvalidOperation:
-        return None
-
-    scaled = (value * (10**places)).quantize(Decimal(1), rounding=ROUND_HALF_UP)
-    return -int(scaled) if negative else int(scaled)
-
-
-def parse_quantity(
-    token: str, *, separator: str = ",", min_digit_ratio: float = 0.6
-) -> Decimal | None:
-    """Parse a quantity, which can be fractional for goods sold by weight."""
-    if not token or digit_ratio(token) < min_digit_ratio:
-        return None
-    candidate = _STRIP.sub("", repair_numeric(token))
-    if not candidate or len(candidate) > MAX_NUMERIC_LEN:
-        return None
-    other = "." if separator == "," else ","
-    candidate = candidate.replace(other, "").replace(separator, ".")
-    try:
-        value = Decimal(candidate)
-    except InvalidOperation:
+        value = Decimal(found.group(1).replace(",", "."))
+    except InvalidOperation:  # pragma: no cover - the pattern only admits numbers
         return None
     return value if value > 0 else None
 
 
-def format_minor(minor: int, *, places: int = 2, separator: str = ",") -> str:
-    """Format cents for display or export."""
+def format_minor(minor: int, fmt: Format) -> str:
+    """Write minor units the way the receipt prints them."""
     sign = "-" if minor < 0 else ""
-    digits = str(abs(minor)).rjust(places + 1, "0")
-    return (
-        f"{sign}{digits[:-places]}{separator}{digits[-places:]}"
-        if places
-        else f"{sign}{digits}"
-    )
+    digits = str(abs(minor)).rjust(fmt.places + 1, "0")
+    if not fmt.places:
+        return f"{sign}{digits}"
+    return f"{sign}{digits[: -fmt.places]}{fmt.separator}{digits[-fmt.places :]}"
 
 
-def reconstruct_quantity(total_minor: int, unit_minor: int) -> Decimal | None:
-    """Work out the quantity from the line total and the unit price."""
-    if unit_minor <= 0 or total_minor <= 0:
-        return None
-    return (Decimal(total_minor) / Decimal(unit_minor)).quantize(Decimal("0.001"))
+def times(quantity: Decimal, unit_minor: int) -> int:
+    """Quantity times unit price, rounded to a whole minor unit as tills do."""
+    return int((quantity * unit_minor).quantize(Decimal(1), rounding="ROUND_HALF_UP"))

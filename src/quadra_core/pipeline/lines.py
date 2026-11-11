@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
-import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # Tesseract uses -1 for page/block/para/line rows, which carry no text.
@@ -276,7 +276,7 @@ def cluster_1d(values: list[float], *, gap: float) -> list[list[float]]:
 
 def discover_price_column(
     lines: list[Line],
-    price_re: re.Pattern[str],
+    is_price: Callable[[str], bool],
     *,
     gap: float = 0.08,
 ) -> tuple[float, float] | None:
@@ -287,7 +287,7 @@ def discover_price_column(
     block = text_block(lines)
     edges: list[float] = []
     for line in lines:
-        matches = [w for w in line.words if price_re.fullmatch(w.text)]
+        matches = [w for w in line.words if is_price(w.text)]
         if matches:
             edges.append(block.fraction(matches[-1].right))
 

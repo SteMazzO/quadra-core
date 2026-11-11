@@ -21,7 +21,6 @@ from quadra_core.pipeline import recheck  # noqa: E402
 from quadra_core.pipeline.extract import extract  # noqa: E402
 from quadra_core.pipeline.lines import drop_speckle, group_lines, load_tsv  # noqa: E402
 from quadra_core.pipeline.ocr import run_on_path  # noqa: E402
-from quadra_core.profiles import loader  # noqa: E402
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 
@@ -56,7 +55,7 @@ def photo(tmp_path_factory):
 
 
 def test_a_rendered_receipt_parses_and_balances(photo):
-    result = parse_image(photo, profile="esselunga")
+    result = parse_image(photo)
     document = result.document
     assert result.status == "ok", document["review"]
     assert [i["line_total_minor"] for i in document["line_items"]] == [230, 149]
@@ -64,6 +63,8 @@ def test_a_rendered_receipt_parses_and_balances(photo):
     assert document["totals"] == {
         "items_subtotal_minor": 379,
         "discounts_minor": -45,
+        "subtotal_minor": None,
+        "tax_minor": None,
         "computed_total_minor": 334,
         "total_minor": 334,
         "total_source": "printed",
@@ -72,13 +73,8 @@ def test_a_rendered_receipt_parses_and_balances(photo):
     }
 
 
-def test_the_shop_is_recognised_without_being_named(photo):
-    document = parse_image(photo).document
-    assert document["profile"]["id"] == "esselunga"
-
-
 def test_the_ocr_and_the_image_it_read_come_back_for_archiving(photo):
-    result = parse_image(photo, profile="esselunga")
+    result = parse_image(photo)
     document = result.document
     assert result.tsv.splitlines()[0].startswith("level")
     # Item boxes are in the prepared image's coordinates, so they must fit it.
@@ -95,12 +91,11 @@ def test_the_price_column_can_be_read_on_its_own(photo):
     """What the repair leans on: the column read apart from the descriptions."""
     result, _report, prepared = run_on_path(photo)
     lines = group_lines(drop_speckle(load_tsv(result.tsv)))
-    profile = next(p for p in loader.available() if p.id == "esselunga")
-    extraction = extract(lines, profile)
+    extraction = extract(lines)
 
     column = recheck.survey(lines, extraction)
     assert column.left is not None
-    readings = recheck.second_opinion(prepared, column, profile)
+    readings = recheck.second_opinion(prepared, column, extraction.fmt)
 
     for item in extraction.items:
         assert item.line_total_minor in readings[item.line_index]
