@@ -172,3 +172,37 @@ def test_column_headings():
     assert is_heading("IVA EURO")
     assert is_heading("Qty Description Amount")
     assert not is_heading("PANE INTEGRALE")
+
+
+def test_an_italian_quantity_line_with_its_barcode_gives_the_quantity():
+    """The Decò layout: '2 PZ X E. 1,59' behind a barcode, above the item."""
+    document = receipt(
+        "DESCRIZIONE IVA Prezzo(€)",
+        "161780442 2 PZ \u00d7 E. 1,59",
+        "ZYMIL YOG. FRAGOLA 10,00% | 3,18",
+        "DECO'UOVA A.TERRA 10,00% | 1,99",
+        "SUBTOTALE | 5,17",
+        "TOTALE COMPLESSIVO | 5,17",
+        "di cui IVA | 0,47",
+    )
+    assert document["status"] == "ok"
+    first = document["line_items"][0]
+    assert (first["quantity"], first["unit_price_minor"]) == ("2", 159)
+
+
+def test_the_time_beside_the_date_is_not_a_price():
+    document = receipt(
+        "01/06/2022 | 12:39",
+        "APPLE | 12,99",
+        "PANE | 0,99",
+        "TOTALE | 13,98",
+    )
+    assert document["status"] == "ok"
+    assert [i["line_total_minor"] for i in document["line_items"]] == [1299, 99]
+
+
+def test_a_letter_misread_as_a_multiplication_sign_does_not_hide_an_item():
+    document = receipt(
+        "MAC. BOV/SUINO ATP 500 x | 6,19", "PANE | 1,00", "TOTALE | 7,19"
+    )
+    assert [i["line_total_minor"] for i in document["line_items"]] == [619, 100]

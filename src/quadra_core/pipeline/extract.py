@@ -120,12 +120,17 @@ _VAT_CODE = re.compile(r"\W{0,2}[A-Za-z]?([A-Da-d])\W{0,2}")
 # How far from the tax-letter column a word may sit and still be read as one.
 _VAT_MARGIN = 0.06
 
-# A line that is only a quantity, such as '8 x 2,99' or '0,456 kg x 12,90 EUR/kg'.
+# A line that is only a quantity and a unit price: '8 x 2,99', '2 PZ X E. 1,59',
+# '0,456 kg x 12,90 EUR/kg'. Only a barcode may come before it.
 _MODIFIER = re.compile(
-    r"\W*(\d+(?:[.,]\d+)?)\s*[^\W\d_]{0,3}\s*[xX*@]\W*(\S*\d)\W*(?:\s\D{1,6})?"
+    r"\W*(?:\d{5,}\W+)?(\d+(?:[.,]\d+)?)\s*[^\W\d_]{0,3}\s*[xX\u00d7*@]\W*(?:E\.?|EUR)?\W*"
+    r"(\d\S*\d|\d)\W*(?:\s\D{1,6})?"
 )
 
 _CURRENCY_MARK = re.compile(rf"(?:{CURRENCY})\.?:?", re.IGNORECASE)
+
+# A date as receipts print it: 01/06/2022, 1.6.22, 2022-06-01.
+_DATE = re.compile(r"\b\d{1,4}[/.-]\d{1,2}[/.-]\d{2,4}\b")
 
 # The share of item lines that must show a quantity in one place for it to be a column.
 _COLUMN_SHARE = 0.5
@@ -499,6 +504,9 @@ def _split(
     rows: list[_Row] = []
     unpriced: list[Line] = []
     for position, line in enumerate(lines):
+        # The time beside a date, '12:39', reads as a price with a misread comma.
+        if _DATE.search(line.text):
+            continue
         money = money_tokens(line, fmt)
         price = price_of(line, money, block, column)
         kind = role(line.text)
